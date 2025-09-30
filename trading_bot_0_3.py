@@ -421,14 +421,30 @@ def check_confirmations(vol, atr_v, cl):
     return {"reasons": reasons}
 
 def calculate_enhanced_confidence(trend, momentum, entry, confirmations):
-    c = STRAT["CONFIDENCE_BASE"]; mult = STRAT["CONFIDENCE_MULTIPLIERS"]
-    if "strong_uptrend" in trend["reasons"] or "strong_downtrend" in trend["reasons"]: c += mult["strong_trend"]
-    if any("momentum" in r for r in momentum["reasons"]): c += mult["macd_momentum"]
-    if any("rsi_optimal" in r for r in momentum["reasons"]: c += mult["rsi_optimal"]
-    if any("clean_breakout" in r for r in entry["reasons"]: c += mult["clean_breakout"]
-    if any("perfect_pullback" in r for r in entry["reasons"]: c += mult["perfect_pullback"]
-    if any("volume_spike" in r for r in confirmations["reasons"]: c += mult["volume_spike"]
-    if "volatility_good" in confirmations["reasons"]: c += mult["volatility_good"]
+    c = STRAT["CONFIDENCE_BASE"]
+    mult = STRAT["CONFIDENCE_MULTIPLIERS"]
+
+    if "strong_uptrend" in trend["reasons"] or "strong_downtrend" in trend["reasons"]:
+        c += mult["strong_trend"]
+
+    if any(("momentum" in r) for r in momentum["reasons"]):
+        c += mult["macd_momentum"]
+
+    if any(("rsi_optimal" in r) for r in momentum["reasons"]):
+        c += mult["rsi_optimal"]
+
+    if any(("clean_breakout" in r) for r in entry["reasons"]):
+        c += mult["clean_breakout"]
+
+    if any(("perfect_pullback" in r) for r in entry["reasons"]):
+        c += mult["perfect_pullback"]
+
+    if any(("volume_spike" in r) for r in confirmations["reasons"]):
+        c += mult["volume_spike"]
+
+    if "volatility_good" in confirmations["reasons"]:
+        c += mult["volatility_good"]
+
     return min(95.0, max(50.0, c))
 
 def enhanced_strategy_signals(df: pd.DataFrame):
