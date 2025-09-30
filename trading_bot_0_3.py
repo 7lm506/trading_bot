@@ -124,49 +124,59 @@ class ExchangeAdapter:
         self.ensure()
 
     def _mk_binance(self):
-        return ccxt.binanceusdm({"enableRateLimit": True, "options": {"defaultType": "future"}, "timeout": 25_000})
+        # Binance USDT-M futures
+        return ccxt.binanceusdm({
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+            "timeout": 25_000
+        })
 
     def _mk_bybit(self):
         # Bybit linear USDT perpetuals
-        return ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap", "hedgeMode": False}, "timeout": 25_000})
+        return ccxt.bybit({
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap", "hedgeMode": False},
+            "timeout": 25_000
+        })
 
-def ensure(self):
-    """Try Binance first; if restricted (451) or fails, switch to Bybit."""
-    # لو فيه اكستشين شغال، جرّبه بسرعة
-    if self.ex and self.name:
+    def ensure(self):
+        """Try Binance first; if restricted (451) or fails, switch to Bybit."""
+        # لو فيه إكستشين شغال خلّك عليه
+        if self.ex and self.name:
+            try:
+                _ = self.ex.timeframes
+                return
+            except Exception:
+                pass
+
+        # Binance أولًا
         try:
-            _ = self.ex.timeframes  # مجرد لمس بسيط
+            ex = self._mk_binance()
+            ex.load_markets()
+            self.ex, self.name = ex, "binanceusdm"
+            log("✅ Using Binance USDT-M")
             return
-        except Exception:
-            pass
+        except ccxt.ExchangeError as e:
+            em = str(e)
+            if ("451" in em) or ("restricted location" in em.lower()) or ("Eligibility" in em):
+                log("⛔ Binance restricted from current region — will use Bybit")
+            else:
+                log(f"⚠️ Binance init error: {em}")
+        except Exception as e:
+            log(f"⚠️ Binance init error: {e}")
 
-    # جرّب Binance
-    try:
-        ex = self._mk_binance()
-        ex.load_markets()
-        self.ex, self.name = ex, "binanceusdm"
-        log("✅ Using Binance USDT-M")
-        return
-    except Exception as e:  # ← بدّلناها من ccxt.ExchangeError إلى Exception
-        em = str(e)
-        if ("451" in em) or ("restricted location" in em.lower()) or ("Eligibility" in em):
-            log("⛔ Binance restricted from current region — will use Bybit")
-        else:
-            log(f"⚠️ Binance init error: {em}")
+        # Bybit بديل
+        try:
+            ex = self._mk_bybit()
+            ex.load_markets()
+            self.ex, self.name = ex, "bybit"
+            log("✅ Using Bybit USDT Perps")
+            return
+        except Exception as e:
+            log(f"❌ Bybit init error: {e}")
+            self.ex, self.name = None, None
 
-    # جرّب Bybit
-    try:
-        ex = self._mk_bybit()
-        ex.load_markets()
-        self.ex, self.name = ex, "bybit"
-        log("✅ Using Bybit USDT Perps")
-        return
-    except Exception as e:
-        log(f"❌ Bybit init error: {e}")
-        self.ex, self.name = None, None
-
-
-    # thin wrappers with retries
+    # أغلفة مع إعادة محاولات خفيفة
     def load_markets(self):
         for _ in range(2):
             try:
@@ -212,7 +222,8 @@ def ensure(self):
             return {}
 
     @property
-    def id(self): return self.name
+    def id(self): 
+        return self.name or "unknown"
 
 EX = ExchangeAdapter()
 
@@ -326,7 +337,7 @@ def fetch_market_meta(symbol) -> Tuple[float,float,Optional[float]]:
     dv = dvol_5m_or_fallback(symbol, df)
     return dv, spr, last
 
-# ====================== STRATEGY (نفس منطقك السابق مختصرًا) ======================
+# ====================== STRATEGY (نفس منطقك السابق) ======================
 STRAT = {
     "EMA_TREND_MIN_DIST": 0.005,
     "EMA_MOMENTUM_PERIODS": 5,
@@ -417,35 +428,28 @@ def check_confirmations(vol, atr_v, cl):
         current = atr_v.iloc[-1]; avg = atr_v.rolling(20).mean().iloc[-1]
         ratio = current / max(1e-12, avg)
         if 0.75 <= ratio <= 2.2: reasons.append("volatility_good")
+        elif ratio > 2.2: reasons.append("volatility_high")
+        else: reasons.append("volatility_low")
     pm = (cl.iloc[-1] - cl.iloc[-5]) / max(1e-12, cl.iloc[-5])
     if abs(pm) > 0.0018: reasons.append(f"price_momentum_{abs(pm):.3f}")
     return {"reasons": reasons}
 
 def calculate_enhanced_confidence(trend, momentum, entry, confirmations):
-    c = STRAT["CONFIDENCE_BASE"]
-    mult = STRAT["CONFIDENCE_MULTIPLIERS"]
-
-    if "strong_uptrend" in trend["reasons"] or "strong_downtrend" in trend["reasons"]:
+    c = STRAT["CONFIDENCE_BASE"]; mult = STRAT["CONFIDENCE_MULTIPLIERS"]
+    if ("strong_uptrend" in trend["reasons"]) or ("strong_downtrend" in trend["reasons"]):
         c += mult["strong_trend"]
-
-    if any(("momentum" in r) for r in momentum["reasons"]):
+    if any(("macd_" in r and "momentum" in r) for r in momentum["reasons"]):
         c += mult["macd_momentum"]
-
     if any(("rsi_optimal" in r) for r in momentum["reasons"]):
         c += mult["rsi_optimal"]
-
     if any(("clean_breakout" in r) for r in entry["reasons"]):
         c += mult["clean_breakout"]
-
     if any(("perfect_pullback" in r) for r in entry["reasons"]):
         c += mult["perfect_pullback"]
-
     if any(("volume_spike" in r) for r in confirmations["reasons"]):
         c += mult["volume_spike"]
-
     if "volatility_good" in confirmations["reasons"]:
         c += mult["volatility_good"]
-
     return min(95.0, max(50.0, c))
 
 def enhanced_strategy_signals(df: pd.DataFrame):
@@ -706,6 +710,8 @@ def main():
                 if fallback:
                     print(f"💡 بديل: {fallback['symbol']} - ثقة {fallback['conf']:.1f}%", flush=True)
                     send_signal(fallback); no_pick_streak = 0
+                else:
+                    print(f"⌛ انتظار {SLEEP_BETWEEN} ثانية", flush=True)
             else:
                 no_pick_streak = 0
                 print(f"🎯 تم العثور على {len(picks)} فرصة!", flush=True)
