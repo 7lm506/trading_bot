@@ -130,40 +130,41 @@ class ExchangeAdapter:
         # Bybit linear USDT perpetuals
         return ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap", "hedgeMode": False}, "timeout": 25_000})
 
-    def ensure(self):
-        """Try Binance first; if restricted (451) or fails, switch to Bybit."""
-        # If already set, test quickly
-        if self.ex and self.name:
-            try:
-                self.ex.timeframes  # touch
-                return
-            except Exception:
-                pass
-
-        # Try Binance
+def ensure(self):
+    """Try Binance first; if restricted (451) or fails, switch to Bybit."""
+    # لو فيه اكستشين شغال، جرّبه بسرعة
+    if self.ex and self.name:
         try:
-            ex = self._mk_binance()
-            ex.load_markets()
-            self.ex, self.name = ex, "binanceusdm"
-            log("✅ Using Binance USDT-M")
+            _ = self.ex.timeframes  # مجرد لمس بسيط
             return
-        except ccxt.ExchangeError as e:
-            em = str(e)
-            if "451" in em or "restricted location" in em.lower() or "Eligibility" in em:
-                log("⛔ Binance restricted from current region — will use Bybit")
-            else:
-                log(f"⚠️ Binance init error: {em}")
+        except Exception:
+            pass
 
-        # Try Bybit
-        try:
-            ex = self._mk_bybit()
-            ex.load_markets()
-            self.ex, self.name = ex, "bybit"
-            log("✅ Using Bybit USDT Perps")
-            return
-        except Exception as e:
-            log(f"❌ Bybit init error: {e}")
-            self.ex, self.name = None, None
+    # جرّب Binance
+    try:
+        ex = self._mk_binance()
+        ex.load_markets()
+        self.ex, self.name = ex, "binanceusdm"
+        log("✅ Using Binance USDT-M")
+        return
+    except Exception as e:  # ← بدّلناها من ccxt.ExchangeError إلى Exception
+        em = str(e)
+        if ("451" in em) or ("restricted location" in em.lower()) or ("Eligibility" in em):
+            log("⛔ Binance restricted from current region — will use Bybit")
+        else:
+            log(f"⚠️ Binance init error: {em}")
+
+    # جرّب Bybit
+    try:
+        ex = self._mk_bybit()
+        ex.load_markets()
+        self.ex, self.name = ex, "bybit"
+        log("✅ Using Bybit USDT Perps")
+        return
+    except Exception as e:
+        log(f"❌ Bybit init error: {e}")
+        self.ex, self.name = None, None
+
 
     # thin wrappers with retries
     def load_markets(self):
