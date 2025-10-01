@@ -1,40 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-Trading_bot_v7_plus (multi-exchange, region-safe)
-- استراتيجية v7 المُحسّنة: EMA20/50 recent cross + Volume Spike
-- TP = 1.2× / 2.2× / 3.5× ATR | SL = 1.15× ATR (افتراضي لتقليل SL المبكر)
-- بعد TP1: SL→BE | بعد TP2: تتبّع EMA20 مع وسادة 0.3×ATR
-- تقرير «لماذا لا توجد توصيات» + Near-Qualify
-- تخزين XLSX (openpyxl) أو CSV تلقائياً
-- يدعم Binance(spot/futures)، Bybit، OKX، Bitget مع Fallback تلقائي عند الحجب (451)
+Trading Bot v7 Plus (EMA20/50 Cross + Volume Spike) — Multi-Exchange + Robust Rate-Limit Handling
+- دخول: اتجاه EMA20/50 + تقاطع حديث ≤ 5 شموع أو تلاصق EMA (≤ 0.25%) + Volume Spike ≥ 1.5x
+- TP = 1.2× / 2.2× / 3.5× ATR   |   SL = 1.15× ATR  (أوسع من v7 لتقليل SL المبكر)
+- بعد TP1: SL→BE   |   بعد TP2: تتبع EMA20 مع وسادة 0.3×ATR
+- تصفية: سيولة ≥ 1,000,000$ | RR ≥ 1.25 | نافذة دخول دقيقة 1–2 من كل شمعة 5م
+- تقارير “لماذا لا توجد توصيات” + “قريبة من التأهيل”
+- تخزين Excel (openpyxl) أو CSV تلقائيًا
+- تبادلات متعددة + Fallback + Backoff لـ OKX 50011
 
-بيئة التشغيل (اختياري):
-EXCHANGE=binanceusdm|bybit|okx|bitget|binance   (افتراضي binanceusdm)
-FALLBACKS=bybit,okx,bitget,binance
-DERIVATIVES=1  (1 للمشتقات، 0 للسبوت)
-TIMEFRAME=5m
-BARS=600
-SCAN_TOP=250
-MIN_DOLLAR_VOLUME=1000000
-MAX_SPREAD_PCT=0.20
-MAX_SIGNALS=3
-COOLDOWN_HOURS=3
-MIN_VOLUME_SPIKE=1.5
-MIN_CONFIDENCE=78.0
-MIN_RR=1.25
-SLEEP_BETWEEN=25
-DATA_DIR=/data
-TG_TOKEN=...
-TG_CHAT_ID=...
+ENV (اختياري):
+  EXCHANGE=binanceusdm|bybit|okx|bitget|bingx|mexc|gateio|kucoin|kucoinfutures|binance   (افتراضي binanceusdm)
+  FALLBACKS=bybit,okx,bitget,bingx,mexc,gateio,kucoin,kucoinfutures,binance
+  DERIVATIVES=1  (1 للمشتقات، 0 للسبوت)
+  QUOTE=USDT
+  TIMEFRAME=5m
+  BARS=600
+  SCAN_TOP=200
+  MAX_SCAN_PER_LOOP=40
+  MIN_DOLLAR_VOLUME=1000000
+  MIN_VOLUME_SPIKE=1.5
+  MIN_CONFIDENCE=78.0
+  MIN_RR=1.25
+  ATR_TP1=1.2  ATR_TP2=2.2  ATR_TP3=3.5  ATR_SL=1.15
+  COOLDOWN_HOURS=3
+  SLEEP_BETWEEN=25
+  OKX_PAUSE_MS=300         (تأخير إضافي بعد كل نداء على OKX)
+  TG_TOKEN=...  TG_CHAT_ID=...
+  OKX_API_KEY/OKX_SECRET/OKX_PASSWORD (لرفع الحدود العامة على بعض النطاقات، اختياري)
 """
 
-import os, time, logging, requests
-import pandas as pd
-import numpy as np
+import os, time, logging, requests, math
+import pandas as pd, numpy as np
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-# ============ Telegram ============
+# =================== Telegram ===================
 TOKEN   = os.getenv("TG_TOKEN", "").strip()
 CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 API_URL = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else None
@@ -42,13 +43,11 @@ API_URL = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else None
 def tg(msg: str):
     try:
         if not API_URL or not CHAT_ID:
-            print("[TG disabled]", msg.replace("\n", " | ")[:300])
+            print("[TG disabled]", msg.replace("\n", " | ")[:500])
             return
-        r = requests.post(
-            f"{API_URL}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=12
-        )
+        r = requests.post(f"{API_URL}/sendMessage",
+                          json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                          timeout=12)
         print("TG status:", r.status_code)
     except Exception as e:
         logging.error(f"TG err: {e}")
@@ -56,37 +55,36 @@ def tg(msg: str):
 def now_utc():
     return datetime.now(timezone.utc)
 
-# ============ إعدادات عامة ============
+# =================== إعدادات ===================
 EXCHANGE_ID   = os.getenv("EXCHANGE", "binanceusdm").strip().lower()
-FALLBACKS_ENV = os.getenv("FALLBACKS", "bybit,okx,bitget,binance")
+FALLBACKS_ENV = os.getenv("FALLBACKS", "bybit,okx,bitget,bingx,mexc,gateio,kucoin,kucoinfutures,binance")
 FALLBACKS     = [x.strip().lower() for x in FALLBACKS_ENV.split(",") if x.strip()]
-
-DERIVATIVES   = os.getenv("DERIVATIVES", "1").strip() == "1"  # 1=margins/perps, 0=spot
+DERIVATIVES   = os.getenv("DERIVATIVES", "1").strip() == "1"
 QUOTE         = os.getenv("QUOTE", "USDT").strip()
 
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 BARS      = int(os.getenv("BARS", "600"))
-SCAN_TOP  = int(os.getenv("SCAN_TOP", "250"))
 
-MIN_DOLLAR_VOLUME = float(os.getenv("MIN_DOLLAR_VOLUME", "1000000"))  # 1M$
-MAX_SPREAD_PCT    = float(os.getenv("MAX_SPREAD_PCT", "0.20")) / 100  # 0.20%
-MAX_SIGNALS       = int(os.getenv("MAX_SIGNALS", "3"))
-COOLDOWN_HOURS    = float(os.getenv("COOLDOWN_HOURS", "3"))
+SCAN_TOP           = int(os.getenv("SCAN_TOP", "200"))
+MAX_SCAN_PER_LOOP  = int(os.getenv("MAX_SCAN_PER_LOOP", str(40)))
+MIN_DOLLAR_VOLUME  = float(os.getenv("MIN_DOLLAR_VOLUME", "1000000"))  # 1M$
+MIN_VOLUME_SPIKE   = float(os.getenv("MIN_VOLUME_SPIKE", "1.5"))
+MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "78.0"))
+MIN_RR_RATIO       = float(os.getenv("MIN_RR", "1.25"))
 
 ATR_TP1 = float(os.getenv("ATR_TP1", "1.2"))
 ATR_TP2 = float(os.getenv("ATR_TP2", "2.2"))
 ATR_TP3 = float(os.getenv("ATR_TP3", "3.5"))
 ATR_SL  = float(os.getenv("ATR_SL",  "1.15"))
 
-MIN_VOLUME_SPIKE  = float(os.getenv("MIN_VOLUME_SPIKE", "1.5"))
-MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "78.0"))
-MIN_RR_RATIO      = float(os.getenv("MIN_RR", "1.25"))
+COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "3"))
+SLEEP_BETWEEN  = int(os.getenv("SLEEP_BETWEEN", "25"))
 
-SLEEP_BETWEEN     = int(os.getenv("SLEEP_BETWEEN", "25"))
+OKX_PAUSE_MS   = int(os.getenv("OKX_PAUSE_MS", "300"))  # تأخير إضافي لـ OKX
 
 DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(__file__)); os.makedirs(DATA_DIR, exist_ok=True)
 
-# ============ تخزين (XLSX/CSV) ============
+# =================== تخزين (XLSX/CSV) ===================
 try:
     from openpyxl import Workbook, load_workbook
     HAS_XLSX = True
@@ -106,8 +104,8 @@ def init_store():
             wb.save(SIG_F)
         if not os.path.exists(REJ_F):
             wb = Workbook(); ws = wb.active; ws.title = "Data"
-            ws.append(["#", "Pair", "RejectReason", "Confidence", "SpreadPct",
-                       "DollarVol", "ATR", "VolumeSpike", "Time"])
+            ws.append(["#", "Pair", "RejectReason", "Confidence", "DollarVol",
+                       "ATR", "VolumeSpike", "Time"])
             wb.save(REJ_F)
     else:
         if not os.path.exists(SIG_F):
@@ -115,8 +113,8 @@ def init_store():
                                   "Result", "EntryTime", "ExitTime", "DurationMin",
                                   "ProfitPct", "EntryReason", "ExitReason"]).to_csv(SIG_F, index=False)
         if not os.path.exists(REJ_F):
-            pd.DataFrame(columns=["#", "Pair", "RejectReason", "Confidence", "SpreadPct",
-                                  "DollarVol", "ATR", "VolumeSpike", "Time"]).to_csv(REJ_F, index=False)
+            pd.DataFrame(columns=["#", "Pair", "RejectReason", "Confidence", "DollarVol",
+                                  "ATR", "VolumeSpike", "Time"]).to_csv(REJ_F, index=False)
 init_store()
 
 def sig_append(row: List):
@@ -147,29 +145,60 @@ def rej_append(row: List):
     except Exception as e:
         logging.error(f"rej_append err: {e}")
 
-# ============ Exchange (multi + fallback) ============
+# =================== Exchanges + Fallback ===================
 import ccxt
 
 def make_exchange(exchange_id: str):
-    exchange_id = exchange_id.lower().strip()
-    if exchange_id == "binanceusdm":
-        return ccxt.binanceusdm({"enableRateLimit": True, "options": {"defaultType": "future"}, "timeout": 25000})
-    if exchange_id == "binance":
-        return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}, "timeout": 25000})
-    if exchange_id == "bybit":
-        # Bybit: perpetuals = swap
-        return ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap" if DERIVATIVES else "spot"}, "timeout": 25000})
-    if exchange_id == "okx":
-        return ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap" if DERIVATIVES else "spot"}, "timeout": 25000})
-    if exchange_id == "bitget":
-        return ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap" if DERIVATIVES else "spot"}, "timeout": 25000})
-    # افتراضي: binance spot
-    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}, "timeout": 25000})
+    x = exchange_id.lower().strip()
+    kw = {"enableRateLimit": True, "timeout": 25000, "options": {}}
 
-def init_exchange():
-    """حاول التهيئة مع fallback تلقائي عند حجب المنطقة أو الأخطاء."""
+    if x == "okx":
+        # دعم مفاتيح OKX (اختياري) — أحيانًا يرفع حدود Public
+        k, s, p = os.getenv("OKX_API_KEY"), os.getenv("OKX_SECRET"), os.getenv("OKX_PASSWORD")
+        if k and s and p:
+            kw.update({"apiKey": k, "secret": s, "password": p})
+        kw["options"]["defaultType"] = "swap" if DERIVATIVES else "spot"
+        return ccxt.okx(kw)
+
+    if x == "binanceusdm":
+        kw["options"]["defaultType"] = "future"
+        return ccxt.binanceusdm(kw)
+    if x == "binance":
+        kw["options"]["defaultType"] = "spot"
+        return ccxt.binance(kw)
+    if x == "bybit":
+        kw["options"]["defaultType"] = "swap" if DERIVATIVES else "spot"
+        return ccxt.bybit(kw)
+    if x == "bitget":
+        kw["options"]["defaultType"] = "swap" if DERIVATIVES else "spot"
+        return ccxt.bitget(kw)
+    if x == "bingx":
+        kw["options"]["defaultType"] = "swap" if DERIVATIVES else "spot"
+        return ccxt.bingx(kw)
+    if x == "mexc":
+        kw["options"]["defaultType"] = "swap" if DERIVATIVES else "spot"
+        return ccxt.mexc(kw)
+    if x in ["gateio", "gate"]:
+        kw["options"]["defaultType"] = "swap" if DERIVATIVES else "spot"
+        return ccxt.gateio(kw)
+    if x == "kucoin":
+        kw["options"]["defaultType"] = "spot"
+        return ccxt.kucoin(kw)
+    if x in ["kucoinfutures", "kucoinfuturesusdtm"]:
+        kw["options"]["defaultType"] = "swap"
+        return ccxt.kucoinfutures(kw)
+
+    kw["options"]["defaultType"] = "spot"
+    return ccxt.binance(kw)
+
+def is_region_block(err: Exception) -> bool:
+    s = str(err).lower()
+    return ("451" in s) or ("restricted location" in s) or ("403 forbidden" in s) or ("cloudfront" in s)
+
+def init_exchange() -> Tuple[ccxt.Exchange, str]:
     candidates = [EXCHANGE_ID] + [x for x in FALLBACKS if x != EXCHANGE_ID]
     last_err = None
+    tried = []
     for exid in candidates:
         try:
             ex = make_exchange(exid)
@@ -177,19 +206,22 @@ def init_exchange():
             tg(f"🔌 <b>Connected</b> → <code>{exid}</code> • Mode: {'Derivatives' if DERIVATIVES else 'Spot'}")
             return ex, exid
         except Exception as e:
+            tried.append(exid)
             last_err = e
-            emsg = str(e)
-            logging.error(f"init_exchange {exid} err: {emsg}")
-            # 451 أو حجب: جرّب التالي
+            logging.error(f"init_exchange {exid} err: {e}")
             continue
-    raise RuntimeError(f"All exchanges failed. Last error: {last_err}")
+    if last_err:
+        if is_region_block(last_err):
+            tg("🛑 <b>All exchanges blocked from this server region.</b>\n"
+               "جرّب <code>EXCHANGE=okx</code> أو <code>bitget</code> أو انقل الخدمة لمنطقة أخرى.")
+        else:
+            tg(f"🛑 <b>Failed to init any exchange.</b>\nآخر خطأ: <code>{str(last_err)[:250]}</code>")
+    raise RuntimeError(f"All exchanges failed. Tried: {tried}. Last error: {last_err}")
 
 ex, EX_ID = init_exchange()
 
-# ============ TA ============
-
+# =================== المؤشرات ===================
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-def sma(s, n): return s.rolling(window=n).mean()
 def rsi(s, n=14):
     d = s.diff(); u, d = np.maximum(d, 0), np.maximum(-d, 0)
     rs = u.ewm(span=n, adjust=False).mean() / (d.ewm(span=n, adjust=False).mean() + 1e-12)
@@ -201,99 +233,114 @@ def tr(h, l, c):
     return pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
 def atr(h, l, c, n=14): return tr(h, l, c).ewm(span=n, adjust=False).mean()
 
-def adx(h, l, c, n=14):
-    plus_dm = h.diff()
-    minus_dm = -l.diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-    tr_val = tr(h, l, c)
-    atr_val = tr_val.ewm(span=n, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(span=n, adjust=False).mean() / (atr_val + 1e-12))
-    minus_di = 100 * (minus_dm.ewm(span=n, adjust=False).mean() / (atr_val + 1e-12))
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12)
-    return dx.ewm(span=n, adjust=False).mean(), plus_di, minus_di
+# =================== Utils / Rate limit ===================
+def sleep_after_call():
+    # تأخير بسيط بعد النداء — OKX أكثر تشدداً
+    if EX_ID == "okx":
+        time.sleep(max(OKX_PAUSE_MS, 250) / 1000.0)
+    else:
+        # احترام معدل ccxt العام
+        time.sleep(max(getattr(ex, "rateLimit", 120), 120) / 1000.0)
 
-# ============ سوق ============
+def fetch_ohlcv_retry(symbol: str, limit: int = BARS, tries: int = 4):
+    delay = 0.6
+    for i in range(tries):
+        try:
+            d = ex.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+            sleep_after_call()
+            return d
+        except Exception as e:
+            s = str(e)
+            if "50011" in s or "Too Many Requests" in s or "rate limit" in s.lower():
+                time.sleep(delay)
+                delay *= 1.6
+                continue
+            logging.error(f"ohlcv err {symbol}: {e}")
+            return None
+    logging.error(f"ohlcv err {symbol}: too many retries")
+    return None
 
-def ohlcv(sym: str, lim=BARS) -> Optional[pd.DataFrame]:
-    try:
-        d = ex.fetch_ohlcv(sym, TIMEFRAME, limit=lim)
-        if len(d) < 200: return None
-        df = pd.DataFrame(d, columns=["ts", "o", "h", "l", "c", "v"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        for col in ["o", "h", "l", "c", "v"]:
-            df[col] = df[col].astype(float)
-        return df
-    except Exception as e:
-        logging.error(f"ohlcv err {sym}: {e}")
-        return None
-
-def last_price(sym: str) -> Optional[float]:
-    try:
-        t = ex.fetch_ticker(sym)
-        return float(t.get("last") or t.get("close"))
-    except Exception:
-        return None
-
-def dollar_vol(df: pd.DataFrame) -> float:
-    try:
-        return float((df["c"].iloc[-30:] * df["v"].iloc[-30:]).sum())
-    except Exception:
-        return 0.0
-
-def spread_pct(sym: str) -> float:
-    try:
-        ob = ex.fetch_order_book(sym, limit=5)
-        bid = ob["bids"][0][0] if ob.get("bids") else None
-        ask = ob["asks"][0][0] if ob.get("asks") else None
-        if not bid or not ask: return 1.0
-        return (ask - bid) / ask
-    except Exception:
-        return 1.0
-
-def list_top_symbols() -> List[str]:
-    """اختيار أفضل الأزواج: نشطة + QUOTE + نوع السوق + أعلى سيولة."""
-    mkts = ex.markets
+# =================== السوق: ترتيب الرموز بدُفعات ===================
+def filter_symbols_by_mode() -> List[str]:
     syms = []
-    for s, d in mkts.items():
-        if not d.get("active"): continue
-        if d.get("quote") != QUOTE: continue
+    for sym, m in ex.markets.items():
+        if not m.get("active", True):
+            continue
         if DERIVATIVES:
-            # اقبل swap/future/linear إن وُجد
-            if not (d.get("swap") or d.get("future") or d.get("linear")):
-                continue
+            # نفضّل سواب خطي USDT
+            if m.get("type") in ("swap","future") and str(m.get("linear")) == "True" and m.get("quote") == QUOTE:
+                syms.append(sym)
         else:
-            if not d.get("spot"):
-                continue
-        syms.append(s)
+            if m.get("type") == "spot" and m.get("quote") == QUOTE:
+                syms.append(sym)
+    return syms
 
-    # رتّب باستخدام fetch_tickers (quoteVolume أو baseVolume*last)
-    try:
-        ticks = ex.fetch_tickers(syms)
-        def notional(t):
-            if not t: return 0.0
-            qv = t.get("quoteVolume")
-            if qv: return float(qv)
-            last = t.get("last") or t.get("close") or 0
-            bv = t.get("baseVolume") or 0
+def chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+_tickers_cache = {"ts": 0.0, "data": {}}
+def get_ranked_symbols(all_syms: List[str], refresh_sec: int = 60) -> Tuple[List[str], Dict[str, dict]]:
+    # استخدم كاش لمدة قصيرة لتقليل استدعاءات API
+    now = time.time()
+    if now - _tickers_cache["ts"] < refresh_sec and _tickers_cache["data"]:
+        tmap = _tickers_cache["data"]
+    else:
+        tmap = {}
+        # اجلب tickers بدُفعات لتفادي 50011
+        for batch in chunked(all_syms, 50 if EX_ID == "okx" else 100):
+            try:
+                t = ex.fetch_tickers(batch)
+                tmap.update(t)
+            except Exception as e:
+                logging.error(f"fetch_tickers batch err: {e}")
+            sleep_after_call()
+        _tickers_cache["ts"] = now
+        _tickers_cache["data"] = tmap
+
+    def vol_score(sym: str) -> float:
+        t = tmap.get(sym, {})
+        # حاول استخدام quoteVolume أو last*baseVolume أو info حق OKX
+        qv = t.get("quoteVolume") or 0
+        if qv:
+            return float(qv)
+        last = t.get("last") or t.get("close") or 0
+        bv = t.get("baseVolume") or 0
+        if last and bv:
             try:
                 return float(last) * float(bv)
-            except Exception:
-                return 0.0
-        syms.sort(key=lambda x: notional(ticks.get(x, {})), reverse=True)
-    except Exception as e:
-        logging.error(f"fetch_tickers sort err: {e}")
+            except:
+                pass
+        info = t.get("info") or {}
+        # OKX: volCcy24h (قيمة) أو volUsd24h
+        for k in ("volUsd24h", "volCcy24h", "volCcy24hUsd"):
+            if k in info:
+                try:
+                    return float(info[k])
+                except:
+                    continue
+        return 0.0
 
-    return syms[:SCAN_TOP]
+    ranked = sorted([s for s in all_syms], key=lambda s: vol_score(s), reverse=True)
+    top = ranked[:SCAN_TOP]
+    return top, tmap
 
-# ============ الاستراتيجية ============
+# =================== Strategy ===================
+def ohlcv_df(raw) -> Optional[pd.DataFrame]:
+    if not raw or len(raw) < 200:
+        return None
+    df = pd.DataFrame(raw, columns=["ts","o","h","l","c","v"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    for col in ["o","h","l","c","v"]:
+        df[col] = df[col].astype(float)
+    return df
 
-def strat(sym: str, df: pd.DataFrame):
+def strat(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     c, h, l, v = df["c"], df["h"], df["l"], df["v"]
     e20, e50 = ema(c, 20), ema(c, 50)
-    macd_v, macd_s = macd(c), macd_sig(macd(c))
-    rsi14 = rsi(c)
     atr14 = float(atr(h, l, c).iloc[-1])
+    macd_v = macd(c); macd_s = macd_sig(macd_v)
+    rsi14 = rsi(c)
 
     # اتجاه
     if e20.iloc[-1] > e50.iloc[-1]:
@@ -301,30 +348,32 @@ def strat(sym: str, df: pd.DataFrame):
     elif e20.iloc[-1] < e50.iloc[-1]:
         side = "SHORT"
     else:
-        return None, {"atr": atr14, "reasons": ["no_clear_trend"]}
+        return None, {"atr": atr14, "reasons": ["no_ema_trend"]}
 
-    # تقاطع حديث أو تلاصق EMAs
-    def recent_cross(_fast, _slow, _side):
-        if _side == "LONG":
-            return (_fast.iloc[-1] > _slow.iloc[-1]) and (_fast.iloc[-6:-1] <= _slow.iloc[-6:-1]).any()
-        else:
-            return (_fast.iloc[-1] < _slow.iloc[-1]) and (_fast.iloc[-6:-1] >= _slow.iloc[-6:-1]).any()
+    # تقاطع حديث ≤ 5 شموع
+    cross_recent = False
+    for i in range(1, 6):
+        if side == "LONG" and (e20.iloc[-i] > e50.iloc[-i]) and (e20.iloc[-i-1] <= e50.iloc[-i-1]):
+            cross_recent = True; break
+        if side == "SHORT" and (e20.iloc[-i] < e50.iloc[-i]) and (e20.iloc[-i-1] >= e50.iloc[-i-1]):
+            cross_recent = True; break
 
-    if not recent_cross(e20, e50, side):
-        ema_dist = abs(e20.iloc[-1] - e50.iloc[-1]) / (e50.iloc[-1] + 1e-12) * 100
-        if ema_dist > 0.35:
-            return None, {"atr": atr14, "reasons": ["no_recent_cross"]}
+    # أو تلاصق ضيق
+    tight = abs(e20.iloc[-1] - e50.iloc[-1]) / (e50.iloc[-1] + 1e-12) * 100 <= 0.25
 
-    # Spike
+    # Volume Spike
     vol_spike = v.iloc[-1] / (v.rolling(20).mean().iloc[-1] + 1e-12)
-    if vol_spike < MIN_VOLUME_SPIKE:
-        return None, {"atr": atr14, "reasons": [f"low_vol_{vol_spike:.1f}x"], "vol_spike": vol_spike}
 
-    # Momentum
-    if side == "LONG" and (macd_v.iloc[-1] <= macd_s.iloc[-1] or rsi14.iloc[-1] >= 72):
-        return None, {"atr": atr14, "reasons": ["macd_not_bull" if macd_v.iloc[-1] <= macd_s.iloc[-1] else f"rsi_overbought_{rsi14.iloc[-1]:.0f}"]}
-    if side == "SHORT" and (macd_v.iloc[-1] >= macd_s.iloc[-1] or rsi14.iloc[-1] <= 28):
-        return None, {"atr": atr14, "reasons": ["macd_not_bear" if macd_v.iloc[-1] >= macd_s.iloc[-1] else f"rsi_oversold_{rsi14.iloc[-1]:.0f}"]}
+    if not (cross_recent or tight):
+        return None, {"atr": atr14, "reasons": ["no_recent_cross"]}
+    if vol_spike < MIN_VOLUME_SPIKE:
+        return None, {"atr": atr14, "reasons": [f"low_vol_{vol_spike:.1f}x"]}
+
+    # زخم منطقي
+    if side == "LONG" and (macd_v.iloc[-1] <= macd_s.iloc[-1] or rsi14.iloc[-1] >= 74):
+        return None, {"atr": atr14, "reasons": ["mom_not_long"]}
+    if side == "SHORT" and (macd_v.iloc[-1] >= macd_s.iloc[-1] or rsi14.iloc[-1] <= 26):
+        return None, {"atr": atr14, "reasons": ["mom_not_short"]}
 
     # شمعة تأكيد
     if side == "LONG" and c.iloc[-1] <= c.iloc[-2]:
@@ -332,261 +381,313 @@ def strat(sym: str, df: pd.DataFrame):
     if side == "SHORT" and c.iloc[-1] >= c.iloc[-2]:
         return None, {"atr": atr14, "reasons": ["no_conf_short"]}
 
-    # ADX بسيط
-    adx_v, plus_di, minus_di = adx(h, l, c)
-    adx_now = float(adx_v.iloc[-1])
-    if adx_now < 16:
-        return None, {"atr": atr14, "reasons": [f"weak_adx_{int(adx_now)}"], "vol_spike": vol_spike}
+    # ثقة بسيطة
+    confidence = 60
+    confidence += 18 if cross_recent else 10
+    confidence += 12 if vol_spike >= (MIN_VOLUME_SPIKE + 0.3) else 6
+    if side == "LONG":
+        confidence += 10 if (macd_v.iloc[-1] > macd_s.iloc[-1] and rsi14.iloc[-1] <= 68) else 4
+    else:
+        confidence += 10 if (macd_v.iloc[-1] < macd_s.iloc[-1] and rsi14.iloc[-1] >= 32) else 4
+    confidence = min(confidence, 100)
 
-    reasons = [
-        "ema20_50_trend",
-        "recent_cross_or_tight",
-        f"vol_spike_{vol_spike:.1f}x",
-        "macd_ok",
-        "rsi_ok",
-        f"adx_{int(adx_now)}"
-    ]
-    return side, {"atr": atr14, "reasons": reasons, "vol_spike": vol_spike}
+    reasons = []
+    reasons.append("ema_trend")
+    reasons.append("fresh_cross" if cross_recent else "ema_tight")
+    reasons.append(f"vol_spike_{vol_spike:.1f}x")
+    reasons.append("macd_ok"); reasons.append("rsi_ok"); reasons.append("conf_candle")
 
-def make_targets(entry: float, atr_val: float, side: str):
+    return side, {"atr": atr14, "reasons": reasons, "conf": confidence, "vol_spike": vol_spike}
+
+def targets(entry: float, atr_val: float, side: str):
+    tps = []
     if side == "LONG":
         tps = [round(entry + atr_val * ATR_TP1, 6),
                round(entry + atr_val * ATR_TP2, 6),
                round(entry + atr_val * ATR_TP3, 6)]
-        sl  = round(entry - atr_val * ATR_SL, 6)
+        sl = round(entry - atr_val * ATR_SL, 6)
     else:
         tps = [round(entry - atr_val * ATR_TP1, 6),
                round(entry - atr_val * ATR_TP2, 6),
                round(entry - atr_val * ATR_TP3, 6)]
-        sl  = round(entry + atr_val * ATR_SL, 6)
+        sl = round(entry + atr_val * ATR_SL, 6)
     return tps, sl
 
-# ============ دورة المسح ============
+def entry_window_5m() -> bool:
+    # نافذة دخول دقيقة 1–2 من كل شمعة 5 دقائق
+    n = now_utc()
+    sec = (n.minute % 5) * 60 + n.second
+    return 60 <= sec <= 120
+
+# =================== Scan / Send / Track ===================
 cooldown: Dict[str, float] = {}
 open_trades: Dict[str, dict] = {}
 reject_stats: Dict[str, int] = {}
+near_misses: List[str] = []
+_symbol_ring: List[str] = []
 
-def scan_cycle() -> List[dict]:
+def last_price_from_tickers(sym: str, tmap: Dict[str, dict]) -> Optional[float]:
+    t = tmap.get(sym, {})
+    v = t.get("last") or t.get("close")
+    return float(v) if v is not None else None
+
+def dollar_vol_est(df: pd.DataFrame) -> float:
     try:
-        syms = list_top_symbols()
+        return float((df["c"].iloc[-30:] * df["v"].iloc[-30:]).sum())
+    except Exception:
+        return 0.0
+
+def scan():
+    global _symbol_ring
+    try:
+        if not _symbol_ring:
+            all_syms = filter_symbols_by_mode()
+            if EX_ID == "okx":
+                # قلل الحمل على OKX
+                all_syms = [s for s in all_syms if ((":USDT" in s) if DERIVATIVES else ("/USDT" in s))]
+            ranked, tmap = get_ranked_symbols(all_syms)
+            _symbol_ring = ranked[:]  # إنشاء حلقة
+            scan_candidates = ranked[:MAX_SCAN_PER_LOOP]
+        else:
+            ranked, tmap = get_ranked_symbols(_symbol_ring)  # نجدد التيكرز فقط
+            scan_candidates = _symbol_ring[:MAX_SCAN_PER_LOOP]
+            _symbol_ring = _symbol_ring[MAX_SCAN_PER_LOOP:] + _symbol_ring[:MAX_SCAN_PER_LOOP]
     except Exception as e:
-        logging.error(f"list_top_symbols err: {e}")
+        logging.error(f"scan prepare err: {e}")
         return []
 
-    picks, near_qualify = [], []
+    picks = []
     reject_stats.clear()
+    near_misses.clear()
 
-    for sym in syms:
+    for sym in scan_candidates:
         try:
             if cooldown.get(sym, 0) > time.time():
                 reject_stats["cooldown"] = reject_stats.get("cooldown", 0) + 1
                 continue
-            if sym in open_trades and not open_trades[sym].get("closed"):
-                continue
 
-            df = ohlcv(sym)
-            if df is None:
+            raw = fetch_ohlcv_retry(sym, BARS)
+            if not raw:
                 reject_stats["ohlcv_fail"] = reject_stats.get("ohlcv_fail", 0) + 1
                 continue
+            df = ohlcv_df(raw)
+            if df is None:
+                reject_stats["short_data"] = reject_stats.get("short_data", 0) + 1
+                continue
 
-            dv = dollar_vol(df)
+            dv = dollar_vol_est(df)
             if dv < MIN_DOLLAR_VOLUME:
                 reject_stats["low_dollar_vol"] = reject_stats.get("low_dollar_vol", 0) + 1
                 continue
 
-            spr = spread_pct(sym)
-            if spr > MAX_SPREAD_PCT:
-                reject_stats["high_spread"] = reject_stats.get("high_spread", 0) + 1
-                continue
-
-            lp = last_price(sym)
-            if not lp:
-                reject_stats["no_price"] = reject_stats.get("no_price", 0) + 1
-                continue
-
-            side, meta = strat(sym, df)
+            side, meta = strat(df)
             if side is None:
-                reason = meta["reasons"][0] if meta.get("reasons") else "unknown"
+                reason = (meta.get("reasons") or ["unknown"])[-1]
                 reject_stats[reason] = reject_stats.get(reason, 0) + 1
-                rej_append([0, sym.replace("/USDT:USDT", "/USDT"), reason, 0.0,
-                            round(spr*100, 3), round(dv, 0),
-                            round(meta.get("atr", 0), 6), round(meta.get("vol_spike", 0) or 0, 2),
-                            now_utc().strftime("%Y-%m-%d %H:%M")])
+                # قريب من التأهيل؟
+                if reason.startswith("low_vol_") or reason.startswith("no_recent_cross"):
+                    near_misses.append(f"{sym}: {reason}")
                 continue
 
-            entry = float(lp)
-            tps, sl = make_targets(entry, meta["atr"], side)
+            lp = last_price_from_tickers(sym, tmap)
+            if lp is None:
+                # آخر سعر من CCXT سريع
+                try:
+                    t = ex.fetch_ticker(sym); sleep_after_call()
+                    lp = float(t.get("last") or t.get("close"))
+                except Exception:
+                    reject_stats["no_price"] = reject_stats.get("no_price", 0) + 1
+                    continue
 
-            tp1_dist = abs(tps[0] - entry)
-            sl_dist  = abs(sl - entry)
-            rr_ratio = (tp1_dist / sl_dist) if sl_dist > 0 else 0.0
-            if rr_ratio < MIN_RR_RATIO:
+            tps, sl = targets(lp, meta["atr"], side)
+            tp1_dist = abs(tps[0] - lp)
+            sl_dist = abs(sl - lp)
+            rr = (tp1_dist / sl_dist) if sl_dist > 0 else 0
+
+            if meta["conf"] < MIN_CONFIDENCE:
+                reject_stats["conf_low"] = reject_stats.get("conf_low", 0) + 1
+                if meta["conf"] >= MIN_CONFIDENCE - 5:
+                    near_misses.append(f"{sym}: conf {meta['conf']:.0f}%")
+                continue
+            if rr < MIN_RR_RATIO:
                 reject_stats["poor_rr"] = reject_stats.get("poor_rr", 0) + 1
-                if rr_ratio > MIN_RR_RATIO * 0.9:
-                    near_qualify.append(f"{sym}: rr={rr_ratio:.2f}")
+                if rr >= MIN_RR_RATIO - 0.07:
+                    near_misses.append(f"{sym}: rr {rr:.2f}")
+                continue
+
+            # نافذة الدخول
+            if not entry_window_5m():
+                reject_stats["not_entry_window"] = reject_stats.get("not_entry_window", 0) + 1
                 continue
 
             picks.append({
                 "symbol": sym,
                 "side": side,
-                "entry": entry,
+                "entry": float(lp),
                 "tps": tps,
                 "sl": sl,
+                "conf": meta["conf"],
+                "atr": meta["atr"],
+                "vol_spike": meta.get("vol_spike", 1.0),
+                "rr": rr,
                 "start_time": now_utc().strftime("%Y-%m-%d %H:%M"),
                 "reasons": meta["reasons"],
-                "rr": rr_ratio
+                "stage": 0,  # 0: قبل TP1, 1: بعد TP1 (SL=BE), 2: تتبع EMA20
             })
-
+            if len(picks) >= 3:
+                break
         except Exception as e:
-            logging.error(f"scan {sym} err: {e}")
+            logging.error(f"scan sym {sym}: {e}")
 
-    if not picks:
-        send_reject_summary(near_qualify)
+    return picks
 
-    return picks[:MAX_SIGNALS]
+def fmt_pair(sym: str) -> str:
+    return sym.replace("/USDT:USDT", "/USDT")
 
-def send_reject_summary(near_qualify: List[str]):
-    if not reject_stats:
-        return
-    total = sum(reject_stats.values()) or 1
-    th = (f"عتبات: RR≥{MIN_RR_RATIO:.2f} • vol_spike≥{MIN_VOLUME_SPIKE:.2f} • "
-          f"SL={ATR_SL:.2f}×ATR • TP1={ATR_TP1:.2f}×ATR")
-    lines = ["📋 <b>لماذا لا توجد توصيات (هذه الدورة)</b>", th, "أكثر أسباب الرفض:"]
-    for k, v in sorted(reject_stats.items(), key=lambda x: x[1], reverse=True)[:6]:
-        pct = (v/total*100)
-        lines.append(f"• {k}: {v} ({pct:.0f}%)")
-    if near_qualify:
-        lines.append("\nقريبة من التأهيل:")
-        lines.extend([f"• {x}" for x in near_qualify[:6]])
-    tg("\n".join(lines))
-
-# ============ إرسال ============
-def send_signal(sig: dict):
-    side_emoji = "🚀" if sig["side"] == "LONG" else "🔻"
-    txt = (f"⚡ <b>v7+ • {EX_ID.upper()}</b>\n"
-           f"{side_emoji} <b>{sig['side']}</b> <code>{sig['symbol'].replace('/USDT:USDT','/USDT')}</code>\n\n"
+def send(sig):
+    txt = (f"<b>⚡ توصية v7+</b>\n"
+           f"{'🚀 LONG' if sig['side']=='LONG' else '🔻 SHORT'} <code>{fmt_pair(sig['symbol'])}</code>\n\n"
            f"💰 Entry: <code>{sig['entry']}</code>\n"
            f"🎯 TP1: <code>{sig['tps'][0]}</code> | TP2: <code>{sig['tps'][1]}</code> | TP3: <code>{sig['tps'][2]}</code>\n"
            f"🛑 SL: <code>{sig['sl']}</code>\n\n"
-           f"⚖️ R/R: <b>1:{sig['rr']:.2f}</b>\n"
-           f"🔎 Signals: <i>{' • '.join(sig['reasons'][:5])}</i>\n"
-           f"🛡️ Risk: SL→BE بعد TP1 • تتبّع EMA20 بعد TP2")
+           f"📊 Conf: <b>{sig['conf']:.0f}%</b> • ⚖️ R/R: <b>{sig['rr']:.2f}</b> • 📈 Vol: <b>{sig['vol_spike']:.1f}x</b>\n"
+           f"🔎 Signals: <i>{' • '.join(sig['reasons'][:4])}</i>\n"
+           f"🛡️ Risk: SL→BE بعد TP1 • تتبع EMA20 بعد TP2 (+0.3×ATR)")
     tg(txt)
-    open_trades[sig["symbol"]] = {**sig, "tp1_hit": False, "tp2_hit": False, "closed": False}
+    open_trades[sig["symbol"]] = sig
     cooldown[sig["symbol"]] = time.time() + COOLDOWN_HOURS * 3600
 
-# ============ تتبّع ============
-def trail_sl_using_ema20(sym: str, st: dict, df: Optional[pd.DataFrame] = None) -> float:
-    try:
-        df = df or ohlcv(sym, 120)
-        if df is None: return st["sl"]
-        c, h, l = df["c"], df["h"], df["l"]
-        e20 = ema(c, 20)
-        atr14 = float(atr(h, l, c).iloc[-1])
-        if st["side"] == "LONG":
-            new_sl = max(st.get("be_price", st["sl"]), round(float(e20.iloc[-1] - 0.3*atr14), 6))
-        else:
-            new_sl = min(st.get("be_price", st["sl"]), round(float(e20.iloc[-1] + 0.3*atr14), 6))
-        return new_sl
-    except Exception:
-        return st["sl"]
+def trailing_sl_from_ema20(sym: str, side: str, atr_val: float) -> Optional[float]:
+    raw = fetch_ohlcv_retry(sym, 60)
+    if not raw:
+        return None
+    df = ohlcv_df(raw)
+    if df is None:
+        return None
+    c = df["c"]
+    e20 = ema(c, 20).iloc[-1]
+    pad = 0.3 * atr_val
+    if side == "LONG":
+        return round(float(e20 - pad), 6)
+    else:
+        return round(float(e20 + pad), 6)
 
-def track_open_trades():
+def xl_on_close(st: dict, res: str, lp: float, exit_rsn: str):
+    exit_t = now_utc().strftime("%Y-%m-%d %H:%M")
+    dur = (datetime.strptime(exit_t, "%Y-%m-%d %H:%M") -
+           datetime.strptime(st["start_time"], "%Y-%m-%d %H:%M")).total_seconds() / 60
+    if st["side"] == "LONG":
+        profit_pct = (lp - st["entry"]) / st["entry"] * 100
+    else:
+        profit_pct = (st["entry"] - lp) / st["entry"] * 100
+    sig_append([0, fmt_pair(st["symbol"]), st["side"], st["entry"],
+                st["tps"][0], st["tps"][1], st["tps"][2], st["sl"],
+                res, st["start_time"], exit_t, round(dur,1), round(profit_pct,2),
+                " • ".join(st.get("reasons", [])[:4]), exit_rsn])
+
+def track():
     for sym, st in list(open_trades.items()):
-        if st.get("closed"):
+        if st.get("closed"): 
             continue
-        lp = last_price(sym)
-        if lp is None:
+        try:
+            t = ex.fetch_ticker(sym); sleep_after_call()
+            lp = float(t.get("last") or t.get("close"))
+        except Exception:
             continue
 
-        side, tps, sl, entry = st["side"], st["tps"], st["sl"], st["entry"]
+        side, tps, entry = st["side"], st["tps"], st["entry"]
         res, exit_rsn = None, ""
 
-        # إدارة بعد TP1/TP2
-        if side == "LONG":
-            if not st["tp1_hit"] and lp >= tps[0]:
-                st["tp1_hit"] = True
-                st["be_price"] = entry
-                st["sl"] = max(st["sl"], entry)
-                tg(f"✅ TP1 • SL→BE\n<code>{sym.replace('/USDT:USDT','/USDT')}</code> @ <code>{lp}</code>")
-            if st["tp1_hit"] and not st["tp2_hit"] and lp >= tps[1]:
-                st["tp2_hit"] = True
-                st["sl"] = trail_sl_using_ema20(sym, st)
-                tg(f"🎯 TP2 • SL تتبّع EMA20→ <code>{st['sl']}</code>\n<code>{sym.replace('/USDT:USDT','/USDT')}</code>")
-        else:
-            if not st["tp1_hit"] and lp <= tps[0]:
-                st["tp1_hit"] = True
-                st["be_price"] = entry
-                st["sl"] = min(st["sl"], entry)
-                tg(f"✅ TP1 • SL→BE\n<code>{sym.replace('/USDT:USDT','/USDT')}</code> @ <code>{lp}</code>")
-            if st["tp1_hit"] and not st["tp2_hit"] and lp <= tps[1]:
-                st["tp2_hit"] = True
-                st["sl"] = trail_sl_using_ema20(sym, st)
-                tg(f"🎯 TP2 • SL تتبّع EMA20→ <code>{st['sl']}</code>\n<code>{sym.replace('/USDT:USDT','/USDT')}</code>")
+        # مراحل الإدارة
+        if st["stage"] == 0:
+            # TP1 أو SL
+            if (side == "LONG" and lp >= tps[0]) or (side == "SHORT" and lp <= tps[0]):
+                st["sl"] = entry  # BE
+                st["stage"] = 1
+                tg(f"🔧 <b>إدارة الصفقة</b> {fmt_pair(sym)} → SL إلى BE @ <code>{st['sl']}</code>")
+            elif (side == "LONG" and lp <= st["sl"]) or (side == "SHORT" and lp >= st["sl"]):
+                res, exit_rsn = "SL", "Stop Loss"
 
-        # تحقق TP3/SL
-        if side == "LONG":
-            if lp <= st["sl"]:
-                res, exit_rsn = "SL", "stopped"
-            elif lp >= tps[2]:
-                res, exit_rsn = "TP3", "trend_cont"
-        else:
-            if lp >= st["sl"]:
-                res, exit_rsn = "SL", "stopped"
-            elif lp <= tps[2]:
-                res, exit_rsn = "TP3", "trend_cont"
+        elif st["stage"] == 1:
+            # TP2 أو SL(BE)
+            if (side == "LONG" and lp >= tps[1]) or (side == "SHORT" and lp <= tps[1]):
+                st["stage"] = 2
+                tg(f"🔧 <b>إدارة الصفقة</b> {fmt_pair(sym)} → بدء تتبع EMA20 (+0.3×ATR)")
+            elif (side == "LONG" and lp <= st["sl"]) or (side == "SHORT" and lp >= st["sl"]):
+                res, exit_rsn = "BE", "Break Even"
+
+        else:  # stage 2: trailing
+            tsl = trailing_sl_from_ema20(sym, side, st["atr"])
+            if tsl is not None:
+                st["sl"] = tsl
+            # TP3 أو SL المتتبع
+            if (side == "LONG" and lp >= tps[2]) or (side == "SHORT" and lp <= tps[2]):
+                res, exit_rsn = "TP3", "Target 3 🎯"
+            elif (side == "LONG" and lp <= st["sl"]) or (side == "SHORT" and lp >= st["sl"]):
+                res, exit_rsn = "TSL", "Trailing SL (EMA20)"
 
         if res:
-            exit_t = now_utc().strftime("%Y-%m-%d %H:%M")
-            dur = (datetime.strptime(exit_t, "%Y-%m-%d %H:%M") -
-                   datetime.strptime(st["start_time"], "%Y-%m-%d %H:%M")).total_seconds() / 60.0
-            profit_pct = ((lp - entry) / entry * 100.0) if side == "LONG" else ((entry - lp) / entry * 100.0)
-            sig_append([0, sym.replace("/USDT:USDT","/USDT"), side, entry,
-                        tps[0], tps[1], tps[2], st["sl"], res,
-                        st["start_time"], exit_t, round(dur, 1), round(profit_pct, 2),
-                        " • ".join(st.get("reasons", [])[:4]), exit_rsn])
-
-            emoji = {"SL": "🛑", "TP3": "🏆"}.get(res, "✅")
-            tg(f"{emoji} <b>{res}</b> {sym.replace('/USDT:USDT','/USDT')} @ <code>{lp}</code>\n"
-               f"P/L: <b>{profit_pct:+.2f}%</b> • مدة: {dur:.0f}m")
-
+            xl_on_close(st, res, lp, exit_rsn)
+            emoji = {"SL":"🛑", "TP3":"🏆", "BE":"➖", "TSL":"🧲"}.get(res, "✅")
+            tg(f"{emoji} <b>{res}</b> — {fmt_pair(sym)} @ <code>{lp}</code>\n"
+               f"⏱️ منذ: {st['start_time']} • إدارة: {exit_rsn}")
             st["closed"] = True
-            cd_hours = COOLDOWN_HOURS * (2.2 if res == "SL" else 1.0)
-            cooldown[sym] = time.time() + cd_hours * 3600
+            # كول داون ديناميكي بسيط
+            cooldown[sym] = time.time() + (COOLDOWN_HOURS * (2.0 if res == "SL" else 1.0)) * 3600
 
-# ============ نافذة الدخول ============
-def entry_window_ok() -> bool:
-    if not TIMEFRAME.endswith("m"):
-        return True
-    frame = int(TIMEFRAME[:-1] or "5")
-    m = now_utc().minute
-    sec_in_candle = (m % frame) * 60 + now_utc().second
-    return 60 <= sec_in_candle <= 120  # دقيقة 1–2 من الشمعة
+# =================== تقارير الرفض ===================
+_last_report_ts = 0.0
+def send_cycle_report():
+    global _last_report_ts
+    if time.time() - _last_report_ts < 20*60:  # كل 20 دقيقة
+        return
+    _last_report_ts = time.time()
 
-# ============ Main ============
+    total = sum(reject_stats.values())
+    if total == 0:
+        return
+
+    # أهم الأسباب
+    top = sorted(reject_stats.items(), key=lambda x: x[1], reverse=True)[:6]
+    lines = [f"📋 <b>لماذا لا توجد توصيات (هذه الدورة)</b>",
+             f"عتبات: conf≥{MIN_CONFIDENCE:.0f} • RR≥{MIN_RR_RATIO:.2f} • vol_spike≥{MIN_VOLUME_SPIKE:.2f}",
+             f"Exchange: {EX_ID.upper()} • Mode: {'Derivatives' if DERIVATIVES else 'Spot'}",
+             "أكثر أسباب الرفض:"]
+    for k, v in top:
+        pct = (v/total*100) if total>0 else 0
+        lines.append(f"• {k}: {v} ({pct:.0f}%)")
+
+    if near_misses:
+        lines.append("\nقريبة من التأهيل:")
+        lines.extend([f"• {s}" for s in near_misses[:6]])
+
+    tg("\n".join(lines))
+
+# =================== Main ===================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    tg(
-        f"🤖 <b>Bot Started - v7+ (EMA20/50)</b>\n"
-        f"🔌 Exchange: <code>{EX_ID}</code> • Mode: {'Derivatives' if DERIVATIVES else 'Spot'}\n"
-        f"⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP}\n"
-        f"🛑 SL: {ATR_SL:.2f}×ATR • 🎯 TP: {ATR_TP1:.2f}/{ATR_TP2:.2f}/{ATR_TP3:.2f}×ATR • RR≥{MIN_RR_RATIO:.2f}\n"
-        f"💧 MinVol: ${MIN_DOLLAR_VOLUME:,.0f} • 📉 MaxSpread: {MAX_SPREAD_PCT*100:.3f}%\n"
-        f"💾 Store: {'XLSX' if HAS_XLSX else 'CSV'} → {DATA_DIR}"
-    )
+    tg("🤖 <b>Bot Started - v7 Plus (EMA20/50 + Volume)</b>\n"
+       f"⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP} • 🔄/دورة: {MAX_SCAN_PER_LOOP}\n"
+       f"🎯 TP: {ATR_TP1}/{ATR_TP2}/{ATR_TP3}×ATR • 🛑 SL: {ATR_SL}×ATR\n"
+       f"⚙️ Exchange: {EX_ID.upper()} • Mode: {'Derivatives' if DERIVATIVES else 'Spot'}")
 
     while True:
         try:
-            if entry_window_ok():
-                for s in scan_cycle():
-                    send_signal(s)
-            # تتبع الصفقات خلال فترات النوم
-            for _ in range(max(1, SLEEP_BETWEEN // 5)):
-                track_open_trades()
-                time.sleep(5)
+            picks = scan()
+            if picks:
+                for s in picks:
+                    send(s)
+                    time.sleep(2)
+            else:
+                send_cycle_report()
+
+            # تتبّع المراكز المفتوحة
+            track()
+
+            time.sleep(SLEEP_BETWEEN)
         except KeyboardInterrupt:
-            tg("🛑 Bot Stopped")
+            tg("🛑 <b>Bot Stopped</b>")
             break
         except Exception as e:
             logging.error(f"main err: {e}")
