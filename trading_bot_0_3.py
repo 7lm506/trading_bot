@@ -1,518 +1,576 @@
 # -*- coding: utf-8 -*-
 """
-Unified Trading Bot (Web Service + Background Loop)
-- Auto exchange fallback (default OKX), cache markets with TTL, TG error throttling
-- Strategy: recent EMA20-50 cross + Volume Spike ≥ 1.5x + momentum checks
-- Dynamic ATR targets: TP1=1.0×ATR, TP2=2.0×ATR, TP3=3.2×ATR | SL=0.8×ATR
-- Liquidity & spread filters, cooldown per symbol, Excel logging
-- FastAPI server binds to $PORT so Render free "Web Service" works
-!! تحذير: مفاتيح تيليجرام حساسة — لا تُشارك الملف علنًا.
+Trading Bot v7_plus (Render-ready, single file)
+- Exchange: OKX (USDT Perp/Swap) with strict rate-limit & backoff
+- Strategy: EMA20/50 recent cross + VolSpike ≥1.5x + ADX≥18 + confirm candle
+- Anti-chase: |price - EMA20| ≤ 1.2 × ATR
+- SL smart: max(1.25×ATR, EMA50 ± 0.35×ATR opposite side)
+- TP: 1.0 / 2.0 / 3.2 × ATR; RR>=1.18 on TP1
+- Trade mgmt: TP1→SL=BE, TP2→trail at EMA20 (update only on new 5m bar)
+- Cooldown per symbol 3h, dollar volume filter ≥ 1M$, spread ≤ 0.20%
+- Excel logs + Telegram
+- FastAPI web server (/healthz) so Render keeps it alive
 """
 
-import os, time, json, logging, threading, requests
-from datetime import datetime, timezone
-import pandas as pd, numpy as np
+import os, time, math, random, logging, threading, requests
+from datetime import datetime, timezone, timedelta
+import pandas as pd
+import numpy as np
 from openpyxl import Workbook, load_workbook
 import ccxt
+from fastapi import FastAPI
+import uvicorn
 
-# ============================= TELEGRAM TOKEN / CHAT =============================
-# مدموجة مباشرة + يمكن تجاوزها بمتغيرات بيئة إن وُجدت
-TG_TOKEN   = os.getenv("TG_TOKEN")   or "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs"
-TG_CHAT_ID = os.getenv("TG_CHAT_ID") or "8429537293"  # اكتبها كنص
+# =============== Telegram ===============
+TG_TOKEN   = os.getenv("TG_TOKEN",   "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs")
+TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "8429537293"))
+TG_API     = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-API_URL = f"https://api.telegram.org/bot{TG_TOKEN}"
-
-# ============================= ENV & DEFAULTS =============================
-# Exchange selection
-MARKET_TYPE = os.getenv("MARKET_TYPE", "spot").strip().lower()  # 'spot' أو 'swap'
-PRIMARY_EX  = os.getenv("EXCHANGE", "okx").strip().lower()
-FALLBACKS   = [x.strip().lower() for x in os.getenv("FALLBACKS", "bitget,mexc,gate,kucoin,kraken").split(",") if x.strip()]
-ALL_EX      = [PRIMARY_EX] + [x for x in FALLBACKS if x and x != PRIMARY_EX]
-
-# Scan/limits
-TIMEFRAME          = os.getenv("TIMEFRAME", "5m")
-BARS               = int(os.getenv("BARS", "500"))
-SLEEP_BETWEEN      = int(os.getenv("SLEEP_BETWEEN", "30"))
-SCAN_TOP           = int(os.getenv("SCAN_TOP", "200"))
-MIN_DOLLAR_VOLUME  = float(os.getenv("MIN_DOLLAR_VOLUME", "1000000"))  # last 30 bars
-MAX_SPREAD_PCT     = float(os.getenv("MAX_SPREAD_PCT", str(0.20 / 100)))
-COOLDOWN_HOURS     = float(os.getenv("COOLDOWN_HOURS", "3"))
-MAX_SIGNALS        = int(os.getenv("MAX_SIGNALS", "2"))
-
-# ATR Multipliers
-ATR_MULT_TP = tuple(float(x) for x in os.getenv("ATR_TP", "1.0,2.0,3.2").split(","))
-ATR_MULT_SL = float(os.getenv("ATR_SL", "0.8"))
-
-# Telegram throttling for repeated errors
-TG_COOLDOWN_SEC = int(os.getenv("TG_ERROR_COOLDOWN_SEC", "1800"))  # 30 min
-_LAST_NOTIF: dict = {}
-
-# OKX rate-limit relief
-OKX_PAUSE_MS       = int(os.getenv("OKX_PAUSE_MS", "350"))  # sleep after each OHLCV to avoid 50011
-MAX_SCAN_PER_LOOP  = int(os.getenv("MAX_SCAN_PER_LOOP", "90"))
-
-# Markets cache (TTL seconds)
-MARKETS_TTL = int(os.getenv("MARKETS_TTL", "900"))  # 15 min
-MARKETS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "markets_cache.json")
-
-# Excel file
-EXCEL = os.path.join(os.path.dirname(__file__), "signals.xlsx")
-
-# ============================= TELEGRAM =============================
-def tg(msg: str, key: str | None = None, force: bool = False):
-    """
-    Send Telegram message with optional throttling via `key`.
-    If `key` is set, we send at most once / TG_COOLDOWN_SEC unless force=True.
-    """
+def tg(text: str):
     try:
-        if key and not force:
-            ts = _LAST_NOTIF.get(key, 0)
-            if time.time() - ts < TG_COOLDOWN_SEC:
-                return
-            _LAST_NOTIF[key] = time.time()
-        requests.post(f"{API_URL}/sendMessage",
-                      json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-                      timeout=10)
+        requests.post(f"{TG_API}/sendMessage",
+                      json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+                      timeout=12)
     except Exception as e:
         logging.error(f"TG err: {e}")
 
-def now():
-    return datetime.now(timezone.utc)
+# =============== Config ===============
+TIMEFRAME          = "5m"
+BARS               = 500
+SCAN_TOP           = int(os.getenv("SCAN_TOP", "120"))
+SLEEP_BETWEEN      = int(os.getenv("SLEEP_BETWEEN", "60"))  # دورة كل دقيقة
+MIN_DOLLAR_VOLUME  = 1_000_000
+MAX_SPREAD_PCT     = 0.20 / 100.0
+COOLDOWN_HOURS     = 3
+MIN_RR             = 1.18
+ADX_MIN            = 18
+VOL_SPIKE_MIN      = 1.5
+EXTENSION_MAX_ATR  = 1.2
+ATR_MULT_TP        = (1.0, 2.0, 3.2)
+SL_ATR_BASE        = 1.25
+SL_BEHIND_EMA50_ATR= 0.35
 
-# ============================= EXCEL =============================
-def init_excel():
-    if not os.path.exists(EXCEL):
+# Rate limit / backoff
+OHLCV_SLEEP_MIN_S  = 0.45
+OHLCV_SLEEP_MAX_S  = 0.75
+OHLCV_CACHE_TTL_S  = 30      # لكل رمز
+TICKERS_TTL_S      = 60
+
+BASE_DIR = os.path.dirname(__file__)
+SIG_XLSX = os.path.join(BASE_DIR, "signals_v7_plus.xlsx")
+REJ_XLSX = os.path.join(BASE_DIR, "reject_v7_plus.xlsx")
+
+def init_excels():
+    if not os.path.exists(SIG_XLSX):
         wb = Workbook(); ws = wb.active; ws.title = "Signals"
         ws.append(["#", "Pair", "Side", "Entry", "TP1", "TP2", "TP3", "SL",
-                   "Result", "EntryTime", "ExitTime", "DurationMin", "Points",
+                   "Result", "EntryTime", "ExitTime", "DurationMin", "ProfitPct",
                    "EntryReason", "ExitReason"])
-        wb.save(EXCEL)
+        wb.save(SIG_XLSX)
+    if not os.path.exists(REJ_XLSX):
+        wb = Workbook(); ws = wb.active; ws.title = "Rejects"
+        ws.append(["#", "Pair", "Reason", "ADX", "VolSpike", "ExtATR", "Spread%", "DVol", "Time"])
+        wb.save(REJ_XLSX)
+init_excels()
 
-def xl_append(sig: dict, res: str, exit_t: str, dur: float, pts: float, exit_rsn: str):
+def xl_append_signal(sig: dict, res: str, exit_t: str, dur_min: float, pl_pct: float, exit_rsn: str):
     try:
-        wb = load_workbook(EXCEL); ws = wb.active
-        ws.append([ws.max_row, sig["symbol"].replace("/USDT:USDT", "/USDT"),
+        wb = load_workbook(SIG_XLSX); ws = wb.active
+        ws.append([ws.max_row,
+                   sig["symbol"].replace("/USDT:USDT", "/USDT"),
                    sig["side"], sig["entry"], *sig["tps"], sig["sl"],
-                   res, sig["start_time"], exit_t, round(dur, 1), round(pts, 5),
-                   " • ".join(sig.get("reasons", [])[:3]), exit_rsn])
-        wb.save(EXCEL)
+                   res, sig["start_time"], exit_t, round(dur_min,1), round(pl_pct,2),
+                   " • ".join(sig.get("reasons", [])[:5]), exit_rsn])
+        wb.save(SIG_XLSX)
     except Exception as e:
-        logging.error(f"XL err: {e}")
+        logging.error(f"XL signal err: {e}")
 
-init_excel()
+def xl_append_reject(sym: str, reason: str, adx: float, vsp: float, ext: float, spr: float, dvol: float):
+    try:
+        wb = load_workbook(REJ_XLSX); ws = wb.active
+        ws.append([ws.max_row, sym.replace("/USDT:USDT","/USDT"), reason,
+                   round(adx or 0,1), round(vsp or 0,2), round(ext or 0,2), round((spr or 0)*100,3),
+                   round(dvol or 0,0), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")])
+        wb.save(REJ_XLSX)
+    except Exception as e:
+        logging.error(f"XL reject err: {e}")
 
-# ============================= TA =============================
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-def rsi(s, n=14):
-    d = s.diff(); u, d = np.maximum(d, 0), np.maximum(-d, 0)
-    rs = u.ewm(span=n, adjust=False).mean() / (d.ewm(span=n, adjust=False).mean() + 1e-12)
-    return 100 - 100 / (1 + rs)
-def macd(s, f=12, sl=26): return ema(s, f) - ema(s, sl)
-def macd_sig(m): return ema(m, 9)
-def tr(h, l, c):
-    pc = c.shift(1)
-    return pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-def atr(h, l, c, n=14): return tr(h, l, c).ewm(span=n, adjust=False).mean()
-
-# ============================= EXCHANGE & MARKETS =============================
-def _build_exchange(ex_id: str):
-    default_type = "spot" if MARKET_TYPE == "spot" else "swap"
-    opts = {"defaultType": default_type}
-    if ex_id in {"okx"}:
-        opts["defaultSubType"] = "linear"
-    ex = getattr(ccxt, ex_id)({
+# =============== Exchange ===============
+def init_exchange_okx():
+    ex = ccxt.okx({
         "enableRateLimit": True,
-        "timeout": 30000,
-        "options": opts,
+        "timeout": 25000,
+        "options": {
+            "defaultType": "swap",   # USDT Perps
+        }
     })
     return ex
 
-def _save_markets_cache(exchange_id: str, symbols: list[str]):
-    try:
-        with open(MARKETS_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"ts": int(time.time()), "exchange": exchange_id, "symbols": symbols}, f)
-    except Exception as e:
-        logging.error(f"save cache err: {e}")
+ex = None
+def ensure_exchange():
+    global ex
+    if ex is None:
+        try:
+            _ex = init_exchange_okx()
+            _ex.load_markets()
+            ex = _ex
+            logging.info("✅ Using exchange: okx")
+        except Exception as e:
+            logging.error(f"init okx failed: {e}")
+            raise
 
-def _load_markets_cache():
+ensure_exchange()
+
+# =============== Caches & Guards ===============
+tickers_cache = {"ts": 0, "data": {}}
+ohlcv_cache   = {}  # sym -> {"ts": epoch, "df": DataFrame}
+
+def sleep_jitter():
+    time.sleep(random.uniform(OHLCV_SLEEP_MIN_S, OHLCV_SLEEP_MAX_S))
+
+def backoff_sleep(attempt):
+    # 0.6, 1.2, 2.4, 4.8, ... seconds
+    time.sleep(0.6 * (2 ** max(0, attempt-1)))
+
+def fetch_tickers_cached():
+    now = time.time()
+    if now - tickers_cache["ts"] < TICKERS_TTL_S and tickers_cache["data"]:
+        return tickers_cache["data"]
+    data = ex.fetch_tickers()
+    tickers_cache["data"] = data
+    tickers_cache["ts"] = now
+    return data
+
+def fetch_ohlcv_with_backoff(sym, timeframe, limit):
+    # Cache
+    now = time.time()
+    cached = ohlcv_cache.get(sym)
+    if cached and now - cached["ts"] < OHLCV_CACHE_TTL_S:
+        return cached["df"]
+
+    last_err = None
+    for attempt in range(1, 6):  # 5 محاولات
+        try:
+            df_raw = ex.fetch_ohlcv(sym, timeframe, limit=limit)
+            if not df_raw or len(df_raw) < 200:
+                last_err = Exception("empty ohlcv")
+                backoff_sleep(attempt)
+                continue
+            df = pd.DataFrame(df_raw, columns=["ts","o","h","l","c","v"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            for col in ["o","h","l","c","v"]:
+                df[col] = df[col].astype(float)
+            ohlcv_cache[sym] = {"ts": now, "df": df}
+            sleep_jitter()
+            return df
+        except ccxt.RateLimitExceeded as e:
+            last_err = e
+            logging.error(f"rate limit {sym}: {e}")
+            backoff_sleep(attempt)
+        except ccxt.ExchangeError as e:
+            # OKX كثير يرجع {"code":"50011","msg":"Too Many Requests"}
+            last_err = e
+            if "50011" in str(e) or "Too Many Requests" in str(e):
+                logging.error(f"OKX 50011 {sym}: backoff attempt {attempt}")
+                backoff_sleep(attempt)
+            else:
+                logging.error(f"ohlcv ex err {sym}: {e}")
+                sleep_jitter()
+        except Exception as e:
+            last_err = e
+            logging.error(f"ohlcv err {sym}: {e}")
+            sleep_jitter()
+    raise last_err or Exception("ohlcv failed")
+
+# =============== TA ===============
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def rsi(s, n=14):
+    d = s.diff(); up, dn = np.maximum(d,0), np.maximum(-d,0)
+    rs = up.ewm(span=n, adjust=False).mean() / (dn.ewm(span=n, adjust=False).mean() + 1e-12)
+    return 100 - 100 / (1 + rs)
+def tr(h, l, c):
+    pc = c.shift(1)
+    return pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+def atr(h, l, c, n=14): return tr(h,l,c).ewm(span=n, adjust=False).mean()
+def adx(h, l, c, n=14):
+    up = h.diff(); dn = -l.diff()
+    up[up < 0] = 0; dn[dn < 0] = 0
+    trv = tr(h,l,c); atrv = trv.ewm(span=n, adjust=False).mean()
+    pdi = 100 * (up.ewm(span=n, adjust=False).mean() / (atrv + 1e-12))
+    mdi = 100 * (dn.ewm(span=n, adjust=False).mean() / (atrv + 1e-12))
+    dx  = 100 * (abs(pdi - mdi) / (pdi + mdi + 1e-12))
+    return dx.ewm(span=n, adjust=False).mean(), pdi, mdi
+
+# =============== Market utils ===============
+def last_price(sym):
     try:
-        if not os.path.exists(MARKETS_CACHE_PATH): return None
-        with open(MARKETS_CACHE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if int(time.time()) - int(data.get("ts", 0)) <= MARKETS_TTL:
-            return data
+        return float(ex.fetch_ticker(sym)["last"])
     except Exception:
         return None
-    return None
 
-EX = None
-EX_ID = None
-MARKET_SYMBOLS: list[str] = []
-
-def _filter_symbols(mkts: dict) -> list[str]:
-    out = []
-    for sym, d in mkts.items():
-        if not d.get("active", True): continue
-        try:
-            quote = d.get("quote") or d.get("quoteId") or ""
-            typ   = d.get("type") or d.get("spot") and "spot" or d.get("swap") and "swap" or ""
-            if quote.upper() != "USDT": continue
-            if MARKET_TYPE == "spot" and typ != "spot": continue
-            if MARKET_TYPE == "swap" and typ != "swap": continue
-            out.append(sym)
-        except Exception:
-            continue
-    return out
-
-def init_exchange_and_markets():
-    global EX, EX_ID, MARKET_SYMBOLS
-    cache = _load_markets_cache()
-    tried = []
-    for ex_id in [x for x in ALL_EX if x]:
-        try:
-            ex = _build_exchange(ex_id)
-            mkts = ex.load_markets()
-            symbols = _filter_symbols(mkts)
-            if not symbols:
-                raise Exception("no USDT symbols after filter")
-            EX, EX_ID, MARKET_SYMBOLS = ex, ex.id, symbols
-            _save_markets_cache(EX_ID, symbols)
-            if tried:
-                tg(f"✅ تم اختيار بورصة بديلة: <b>{EX_ID}</b> (بدلاً من {', '.join(tried)})", key="ex_switched", force=True)
-            logging.info(f"Using exchange: {EX_ID}, symbols: {len(MARKET_SYMBOLS)}")
-            return
-        except Exception as e:
-            tried.append(ex_id)
-            logging.error(f"init_exchange {ex_id} err: {e}")
-    if cache and cache.get("symbols"):
-        try:
-            ex_id = cache.get("exchange", "okx")
-            ex = _build_exchange(ex_id)
-            try:
-                ex.load_markets()
-            except Exception as e:
-                logging.error(f"load_markets on cached exchange {ex_id} err: {e}")
-                raise
-            EX, EX_ID, MARKET_SYMBOLS = ex, ex.id, cache["symbols"]
-            tg("⚠️ استخدمنا كاش الرموز مؤقتًا بسبب فشل التحميل من البورصات.", key="mkts_error")
-            return
-        except Exception as e:
-            logging.error(f"cache fallback err: {e}")
-    tg("⚠️ خطأ في تحميل قائمة العملات — سيتم إعادة المحاولة لاحقًا. (قد يكون حجب من البورصات)", key="mkts_error")
-
-# ============================= MARKET HELPERS =============================
-def _safe_sleep_after_call():
-    if EX_ID == "okx":
-        time.sleep(OKX_PAUSE_MS / 1000.0)
-
-def ohlcv(sym, lim=BARS) -> pd.DataFrame | None:
+def spread_pct(sym):
     try:
-        data = EX.fetch_ohlcv(sym, TIMEFRAME, limit=lim)
-        _safe_sleep_after_call()
-        if not data or len(data) < 200:
-            return None
-        df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        for col in ["o", "h", "l", "c", "v"]:
-            df[col] = df[col].astype(float)
-        return df
-    except Exception as e:
-        logging.error(f"ohlcv err {sym}: {e}")
-        return None
-
-def fetch_tickers_safe() -> dict:
-    try:
-        t = EX.fetch_tickers()
-        _safe_sleep_after_call()
-        return t or {}
-    except Exception as e:
-        logging.error(f"fetch_tickers err: {e}")
-        return {}
-
-def spread_pct(sym) -> float:
-    try:
-        ob = EX.fetch_order_book(sym, limit=5)
-        _safe_sleep_after_call()
-        bid = ob["bids"][0][0] if ob.get("bids") else None
-        ask = ob["asks"][0][0] if ob.get("asks") else None
-        if not bid or not ask: return 1.0
+        ob = ex.fetch_order_book(sym, limit=5)
+        bid, ask = ob["bids"][0][0], ob["asks"][0][0]
+        if not ask: return 1.0
         return (ask - bid) / ask
     except Exception:
         return 1.0
 
-def dollar_vol_last30(df: pd.DataFrame) -> float:
+def dollar_vol(df):
     try:
         return float((df["c"].iloc[-30:] * df["v"].iloc[-30:]).sum())
     except Exception:
         return 0.0
 
-# ============================= STRATEGY =============================
-def strat(sym: str, df: pd.DataFrame):
-    c, h, l, v = df["c"], df["h"], df["l"], df["v"]
-    e20, e50 = ema(c, 20), ema(c, 50)
-    m_val = macd(c); m_sig = macd_sig(m_val)
-    r14 = rsi(c)
-    a14 = float(atr(h, l, c).iloc[-1])
+def top_symbols(limit=SCAN_TOP):
+    ticks = fetch_tickers_cached()
+    syms = []
+    for s, m in ex.markets.items():
+        if not m.get("active"): continue
+        if m.get("type") != "swap": continue
+        if m.get("quote") != "USDT": continue
+        syms.append(s)
+    # sort by quoteVolume or volCcy24h
+    def qv(t):
+        if not t: return 0.0
+        v = t.get("quoteVolume") or t.get("baseVolume")
+        if v: return float(v or 0)
+        info = t.get("info") or {}
+        # OKX: volCcy24h is quote vol in ccy
+        return float(info.get("volCcy24h") or 0)
+    syms.sort(key=lambda s: qv(ticks.get(s, {})), reverse=True)
+    return syms[:limit]
 
-    def cross_recent(_fast, _slow, _side):
-        if _side == "LONG":
-            return (_fast.iloc[-1] > _slow.iloc[-1]) and (_fast.iloc[-6:-1] <= _slow.iloc[-6:-1]).any()
-        else:
-            return (_fast.iloc[-1] < _slow.iloc[-1]) and (_fast.iloc[-6:-1] >= _slow.iloc[-6:-1]).any()
+# =============== Strategy ===============
+reject_counter = {}
+def strat(sym, df):
+    c,h,l,v = df["c"], df["h"], df["l"], df["v"]
+    last = float(c.iloc[-1])
+    e20, e50 = ema(c,20), ema(c,50)
+    atr14 = float(atr(h,l,c).iloc[-1])
+    adx14, _, _ = adx(h,l,c)
+    adx_cur = float(adx14.iloc[-1])
+    vsp = float(v.iloc[-1] / (v.rolling(20).median().iloc[-1] + 1e-12))
 
+    # trend
     if e20.iloc[-1] > e50.iloc[-1]:
         side = "LONG"
     elif e20.iloc[-1] < e50.iloc[-1]:
         side = "SHORT"
     else:
-        return None, {"atr": a14, "reasons": ["no_ema_cross"]}
+        return None, {"reasons":["no_trend"], "atr":atr14}
 
-    if not cross_recent(e20, e50, side):
-        return None, {"atr": a14, "reasons": ["no_recent_cross"]}
+    # recent cross within last 6 bars
+    def crossed_recent(f, s, side):
+        for i in range(1, 7):
+            prev_ok = f.iloc[-i-1] <= s.iloc[-i-1] if side=="LONG" else f.iloc[-i-1] >= s.iloc[-i-1]
+            now_ok  = f.iloc[-i]   >  s.iloc[-i]   if side=="LONG" else f.iloc[-i]   <  s.iloc[-i]
+            if prev_ok and now_ok:
+                return True, i
+        return False, None
 
-    vol_spike = v.iloc[-1] / (v.rolling(20).mean().iloc[-1] + 1e-12)
-    if vol_spike < 1.5:
-        return None, {"atr": a14, "reasons": ["low_volume"]}
+    cross_ok, cross_age = crossed_recent(e20, e50, side)
+    if not cross_ok:
+        return None, {"reasons":["no_recent_cross"], "atr":atr14}
 
-    if side == "LONG" and (m_val.iloc[-1] <= m_sig.iloc[-1] or r14.iloc[-1] >= 70):
-        return None, {"atr": a14, "reasons": ["weak_mom_long"]}
-    if side == "SHORT" and (m_val.iloc[-1] >= m_sig.iloc[-1] or r14.iloc[-1] <= 30):
-        return None, {"atr": a14, "reasons": ["weak_mom_short"]}
+    if vsp < VOL_SPIKE_MIN:
+        return None, {"reasons":[f"low_vol_{vsp:.1f}x"], "atr":atr14}
 
-    if side == "LONG" and c.iloc[-1] <= c.iloc[-2]:
-        return None, {"atr": a14, "reasons": ["no_conf_long"]}
-    if side == "SHORT" and c.iloc[-1] >= c.iloc[-2]:
-        return None, {"atr": a14, "reasons": ["no_conf_short"]}
+    if adx_cur < ADX_MIN:
+        return None, {"reasons":[f"weak_adx_{int(adx_cur)}"], "atr":atr14}
 
-    return side, {"atr": a14, "reasons": [
-        "ema_cross", f"vol_spike_{vol_spike:.1f}x",
-        "macd_ok", "rsi_ok", "conf_candle"
-    ]}
+    # anti-chase
+    ext_atr = abs(last - e20.iloc[-1]) / (atr14 + 1e-12)
+    if ext_atr > EXTENSION_MAX_ATR:
+        return None, {"reasons":["extended_from_ema20"], "atr":atr14}
+
+    # confirm candle
+    if side=="LONG" and not (c.iloc[-1] > c.iloc[-2]): 
+        return None, {"reasons":["no_confirm_long"], "atr":atr14}
+    if side=="SHORT" and not (c.iloc[-1] < c.iloc[-2]):
+        return None, {"reasons":["no_confirm_short"], "atr":atr14}
+
+    # RSI extremes
+    r = float(rsi(c).iloc[-1])
+    if (side=="LONG" and r>=70) or (side=="SHORT" and r<=30):
+        return None, {"reasons":[f"rsi_extreme_{int(r)}"], "atr":atr14}
+
+    reasons = [f"ema20/50_cross_{cross_age}c", f"vol_spike_{vsp:.1f}x", f"adx_{int(adx_cur)}",
+               "confirm_candle", "rsi_ok"]
+    return side, {"atr":atr14, "reasons": reasons}
+
+def build_sl(entry, side, atr_val, ema50_last):
+    if side=="LONG":
+        return round(min(entry - SL_ATR_BASE*atr_val,
+                         ema50_last - SL_BEHIND_EMA50_ATR*atr_val), 6)
+    else:
+        return round(max(entry + SL_ATR_BASE*atr_val,
+                         ema50_last + SL_BEHIND_EMA50_ATR*atr_val), 6)
 
 def targets(entry, atr_val, side):
-    m1, m2, m3 = ATR_MULT_TP; slm = ATR_MULT_SL
-    if side == "LONG":
-        return [round(entry + atr_val * m1, 6),
-                round(entry + atr_val * m2, 6),
-                round(entry + atr_val * m3, 6)], round(entry - atr_val * slm, 6)
+    m1, m2, m3 = ATR_MULT_TP
+    if side=="LONG":
+        return [round(entry + m1*atr_val,6), round(entry + m2*atr_val,6), round(entry + m3*atr_val,6)]
     else:
-        return [round(entry - atr_val * m1, 6),
-                round(entry - atr_val * m2, 6),
-                round(entry - atr_val * m3, 6)], round(entry + atr_val * slm, 6)
+        return [round(entry - m1*atr_val,6), round(entry - m2*atr_val,6), round(entry - m3*atr_val,6)]
 
-def entry_window() -> bool:
-    # 5m TF: نافذة دخول 90..150 ثانية بعد بداية الشمعة
-    t = now()
-    sec = (t.minute % 5) * 60 + t.second
-    return 90 <= sec <= 150
+def entry_window_ok():
+    now = datetime.now(timezone.utc)
+    sec = (now.minute % 5)*60 + now.second
+    return 30 <= sec <= 150
 
-# ============================= SCAN/SEND/TRACK =============================
-cooldown: dict[str, float] = {}
-open_trades: dict[str, dict] = {}
+# =============== Scan/Send/Track ===============
+cooldown   = {}  # sym -> epoch
+open_trades= {}  # sym -> state
 
-def _rank_symbols_by_volume(symbols: list[str]) -> list[str]:
-    tickers = fetch_tickers_safe()
-    if not tickers:
-        return symbols[:SCAN_TOP]
-    def _qv(sym):
-        t = tickers.get(sym) or {}
-        vq = t.get("quoteVolume")
-        if vq is None:
-            try:
-                bv = float(t.get("baseVolume") or 0)
-                last = float(t.get("last") or t.get("close") or 0)
-                vq = bv * last
-            except Exception:
-                vq = 0
-        try:
-            return float(vq or 0)
-        except Exception:
-            return 0.0
-    symbols_sorted = sorted(symbols, key=_qv, reverse=True)
-    return symbols_sorted[:SCAN_TOP]
+def scan_cycle():
+    global reject_counter
+    reject_counter = {}
 
-def scan() -> list[dict]:
-    if EX is None:
-        init_exchange_and_markets()
-        if EX is None:
-            return []
+    try:
+        syms = top_symbols(SCAN_TOP)
+        logging.info(f"Scan syms: {len(syms)}")
+    except Exception as e:
+        tg("⚠️ خطأ في تحميل قائمة العملات — سيعاد المحاولة تلقائيًا")
+        logging.error(f"load markets error: {e}")
+        return []
+
     picks = []
-    symbols = _rank_symbols_by_volume(MARKET_SYMBOLS)
-    symbols = symbols[:MAX_SCAN_PER_LOOP]
-
-    for sym in symbols:
+    for sym in syms:
         try:
-            if cooldown.get(sym, 0) > time.time(): 
-                continue
-            df = ohlcv(sym, BARS)
-            if df is None: 
-                continue
-            dv = dollar_vol_last30(df)
-            if dv < MIN_DOLLAR_VOLUME: 
-                continue
-            if spread_pct(sym) > MAX_SPREAD_PCT:
+            if cooldown.get(sym, 0) > time.time():
+                reject_counter["cooldown"] = reject_counter.get("cooldown",0)+1
                 continue
 
-            entry = float(df["c"].iloc[-1])
+            spr = spread_pct(sym)
+            if spr > MAX_SPREAD_PCT:
+                reject_counter["high_spread"] = reject_counter.get("high_spread",0)+1
+                continue
+
+            df = fetch_ohlcv_with_backoff(sym, TIMEFRAME, BARS)
+            dvol = dollar_vol(df)
+            if dvol < MIN_DOLLAR_VOLUME:
+                reject_counter["low_dvol"] = reject_counter.get("low_dvol",0)+1
+                continue
+
+            lp = float(df["c"].iloc[-1])
+
             side, meta = strat(sym, df)
             if side is None:
+                reason = (meta.get("reasons") or ["unknown"])[0]
+                reject_counter[reason] = reject_counter.get(reason,0)+1
+                # سجّل الرفض الرئيسي
+                xl_append_reject(sym, reason, None, None, None, spr, dvol)
                 continue
 
-            tps, sl = targets(entry, meta["atr"], side)
+            e50 = float(ema(df["c"],50).iloc[-1])
+            sl = build_sl(lp, side, meta["atr"], e50)
+            tps = targets(lp, meta["atr"], side)
+
+            # RR check on TP1
+            rr = abs((tps[0]-lp) / (sl-lp)) if (sl-lp) != 0 else 0
+            if rr < MIN_RR:
+                reject_counter["poor_rr"] = reject_counter.get("poor_rr",0)+1
+                xl_append_reject(sym, "poor_rr", None, None, None, spr, dvol)
+                continue
+
             picks.append({
-                "symbol": sym, "side": side, "entry": entry, "tps": tps, "sl": sl,
-                "conf": 78.0, "atr": meta["atr"],
-                "start_time": now().strftime("%Y-%m-%d %H:%M"),
-                "reasons": meta["reasons"]
+                "symbol": sym, "side": side, "entry": lp, "tps": tps, "sl": sl,
+                "atr": meta["atr"], "reasons": meta["reasons"],
+                "start_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "state": "OPEN", "tp_stage": 0,
+                "last_bar_time": int(df["ts"].iloc[-1].timestamp())
             })
-
-            if len(picks) >= MAX_SIGNALS:
-                break
         except Exception as e:
-            logging.error(f"scan sym err {sym}: {e}")
+            logging.error(f"scan {sym}: {e}")
+    return picks[:2]  # أقصى إشارتين في الدورة
 
-    if picks and not entry_window():
-        logging.info("⏳ خارج نافذة الدخول — سيتم تجاهل الإشارات الآن.")
-        return []
-    return picks
-
-def send(sig: dict):
-    txt = (f"<b>🔥 توصية ذكية</b> • <i>{EX_ID.upper() if EX_ID else ''}</i>\n"
-           f"{'🚀 LONG' if sig['side']=='LONG' else '🔻 SHORT'} <code>{sig['symbol'].replace('/USDT:USDT','/USDT')}</code>\n"
+def send_signal(sig):
+    emoji = "🚀" if sig["side"]=="LONG" else "🔻"
+    txt = (f"<b>⚡ Grade B • Ultra Precise v7+</b>\n"
+           f"{emoji} <b>{sig['side']}</b> <code>{sig['symbol'].replace('/USDT:USDT','/USDT')}</code>\n\n"
            f"💰 Entry: <code>{sig['entry']}</code>\n"
            f"🎯 TP1: <code>{sig['tps'][0]}</code> | TP2: <code>{sig['tps'][1]}</code> | TP3: <code>{sig['tps'][2]}</code>\n"
-           f"🛑 SL: <code>{sig['sl']}</code>\n"
-           f"🔎 Reasons: <i>{' • '.join(sig.get('reasons', [])[:3])}</i>")
+           f"🛑 SL: <code>{sig['sl']}</code>\n\n"
+           f"🔎 Signals: <i>{' • '.join(sig['reasons'][:5])}</i>\n"
+           f"🛡️ Risk: SL→BE بعد TP1 • تتبع EMA20 بعد TP2")
     tg(txt)
     open_trades[sig["symbol"]] = sig
-    cooldown[sig["symbol"]] = time.time() + COOLDOWN_HOURS * 3600
+    cooldown[sig["symbol"]] = time.time() + COOLDOWN_HOURS*3600
 
-def _last_close(sym: str) -> float | None:
-    df = ohlcv(sym, 3)
-    if df is None or df.empty: return None
-    return float(df["c"].iloc[-1])
+def send_cycle_diag():
+    reasons_sorted = sorted(reject_counter.items(), key=lambda x: x[1], reverse=True)
+    lines = [f"📋 <b>لماذا لا توجد توصيات (الدورة)</b>",
+             f"عتبات: ADX≥{ADX_MIN} • RR≥{MIN_RR} • vol≥{VOL_SPIKE_MIN}× • امتداد≤{EXTENSION_MAX_ATR}×ATR"]
+    if reasons_sorted:
+        lines.append("أكثر أسباب الرفض:")
+        for k,v in reasons_sorted[:6]:
+            lines.append(f"• {k}: {v}")
+    tg("\n".join(lines))
 
-def track():
+def res_exit(sym, st, result, price, exit_reason):
+    exit_t = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    dur = (datetime.strptime(exit_t, "%Y-%m-%d %H:%M")
+           - datetime.strptime(st["start_time"], "%Y-%m-%d %H:%M")).total_seconds()/60
+    if st["side"]=="LONG":
+        pl_pct = (price - st["entry"]) / st["entry"] * 100
+    else:
+        pl_pct = (st["entry"] - price) / st["entry"] * 100
+    xl_append_signal(st, result, exit_t, dur, pl_pct, exit_reason)
+    emoji = {"SL":"🛑", "TP1":"✅", "TP2":"🎉", "TP3":"🏆"}.get(result, "✅")
+    tg(f"{emoji} <b>{result}</b> {sym.replace('/USDT:USDT','/USDT')} @ <code>{price}</code>\n"
+       f"P/L: <b>{pl_pct:+.2f}%</b> • مدة: {dur:.0f}m\n"
+       f"خروج: {exit_reason}")
+    st["state"] = "CLOSED"
+
+def maybe_update_trailing(st):
+    # حدّث EMA20 فقط عند ظهور شمعة 5م جديدة لتقليل الطلبات
+    sym = st["symbol"]
+    try:
+        df = fetch_ohlcv_with_backoff(sym, TIMEFRAME, 120)
+        last_bar = int(df["ts"].iloc[-1].timestamp())
+        if last_bar == st.get("last_bar_time"):
+            return  # لم تتكوّن شمعة جديدة
+        st["last_bar_time"] = last_bar
+        e20 = float(ema(df["c"],20).iloc[-1])
+        if st["side"]=="LONG":
+            st["sl"] = max(st["sl"], e20)
+        else:
+            st["sl"] = min(st["sl"], e20)
+    except Exception as e:
+        logging.error(f"trail update {sym}: {e}")
+
+def track_cycle():
     for sym, st in list(open_trades.items()):
-        if st.get("closed"): 
+        if st.get("state") != "OPEN":
             continue
-        lp = _last_close(sym)
-        if lp is None: 
+        lp = last_price(sym)
+        if lp is None:
             continue
-        side, tps, sl, entry = st["side"], st["tps"], st["sl"], st["entry"]
-        res, exit_rsn = None, ""
-        if side == "LONG":
+        side = st["side"]; tps = st["tps"]; sl = st["sl"]; entry = st["entry"]
+
+        if side=="LONG":
             if lp <= sl:
-                res, exit_rsn = "SL", "اختراق كاذب"
+                res_exit(sym, st, "SL", lp, "Stop Loss")
+                continue
+            if st["tp_stage"] < 1 and lp >= tps[0]:
+                st["tp_stage"] = 1
+                st["sl"] = entry
+                tg(f"✅ TP1 • SL→BE • {sym.replace('/USDT:USDT','/USDT')} @ <code>{lp}</code>")
+            elif st["tp_stage"] < 2 and lp >= tps[1]:
+                st["tp_stage"] = 2
+                maybe_update_trailing(st)
+                tg(f"🎯 TP2 • تتبع SL عند EMA20≈<code>{st['sl']:.6f}</code> • {sym.replace('/USDT:USDT','/USDT')}")
             elif lp >= tps[2]:
-                res, exit_rsn = "TP3", "استمرار الترند"
+                res_exit(sym, st, "TP3", lp, "Target 3 🎯")
         else:
             if lp >= sl:
-                res, exit_rsn = "SL", "اختراق كاذب"
+                res_exit(sym, st, "SL", lp, "Stop Loss")
+                continue
+            if st["tp_stage"] < 1 and lp <= tps[0]:
+                st["tp_stage"] = 1
+                st["sl"] = entry
+                tg(f"✅ TP1 • SL→BE • {sym.replace('/USDT:USDT','/USDT')} @ <code>{lp}</code>")
+            elif st["tp_stage"] < 2 and lp <= tps[1]:
+                st["tp_stage"] = 2
+                maybe_update_trailing(st)
+                tg(f"🎯 TP2 • تتبع SL عند EMA20≈<code>{st['sl']:.6f}</code> • {sym.replace('/USDT:USDT','/USDT')}")
             elif lp <= tps[2]:
-                res, exit_rsn = "TP3", "استمرار الترند"
+                res_exit(sym, st, "TP3", lp, "Target 3 🎯")
 
-        if res:
-            exit_t = now().strftime("%Y-%m-%d %H:%M")
-            dur = (datetime.strptime(exit_t, "%Y-%m-%d %H:%M") -
-                   datetime.strptime(st["start_time"], "%Y-%m-%d %H:%M")).total_seconds() / 60
-            pts = (abs(lp - entry) if res.startswith("TP") else -abs(lp - entry))
-            xl_append(st, res, exit_t, dur, pts, exit_rsn)
-            emoji = {"SL": "🛑", "TP3": "🏆"}.get(res, "✅")
-            tg(f"{emoji} <b>{res}</b> {sym.replace('/USDT:USDT','/USDT')} @ {lp}\n"
-               f"سبب الدخول: {' • '.join(st.get('reasons', [])[:3])}\n"
-               f"سبب الخروج: {exit_rsn}")
-            st["closed"] = True
-            cooldown[sym] = time.time() + COOLDOWN_HOURS * 3600
-
-# ============================= DIAG REPORT =============================
-def diag_report() -> str:
+# =============== Diagnostics (2h) ===============
+def diag_report_2h():
     try:
-        df = pd.read_excel(EXCEL, sheet_name="Signals")
-        if df.empty:
-            return "لا توجد بيانات بعد."
-        sl_df = df[df["Result"] == "SL"]
-        tp_df = df[df["Result"] == "TP3"]
-        top_loss_reason = sl_df["EntryReason"].mode().iloc[0] if not sl_df.empty else "—"
-        top_exit_loss  = sl_df["ExitReason"].mode().iloc[0] if not sl_df.empty else "—"
-        worst_pair = sl_df["Pair"].value_counts().index[0] if not sl_df.empty else "—"
-        total, tp3, sl = len(df), len(tp_df), len(sl_df)
-        wr = (tp3 / total * 100) if total else 0
-        avg_dur_sl = float(sl_df["DurationMin"].mean()) if not sl_df.empty else 0
-        avg_dur_tp = float(tp_df["DurationMin"].mean()) if not tp_df.empty else 0
-        return (
-            f"<b>📊 تقرير التشخيص</b>\n"
-            f"الإشارات: {total} 🏆 TP3: {tp3} 🛑 SL: {sl}\n"
-            f"نسبة الفوز: {wr:.1f}%\n"
-            f"متوسط SL: {avg_dur_sl:.0f} دقيقة 🏆 TP3: {avg_dur_tp:.0f} دقيقة\n\n"
-            f"أسوأ زوج: <code>{worst_pair}</code>\n"
-            f"أكثر سبب دخول خسر: <code>{top_loss_reason}</code>\n"
-            f"أكثر سبب خروج خسر: <code>{top_exit_loss}</code>"
-        )
-    except Exception:
-        return "تعذّر قراءة Excel."
+        wb = load_workbook(SIG_XLSX); ws = wb.active
+        if ws.max_row <= 1:
+            tg("📊 لا توجد بيانات بعد.")
+            return
+        total = ws.max_row - 1
+        wins = 0; total_pl = 0.0
+        sl_rows = []; tp_rows = []
+        for r in range(2, ws.max_row+1):
+            res = ws.cell(r,9).value or ""
+            pl  = float(ws.cell(r,13).value or 0)
+            total_pl += pl
+            if res.startswith("TP"): wins += 1
+            if res == "SL": sl_rows.append(r)
+            if res == "TP3": tp_rows.append(r)
+        wr = wins/total if total else 0.0
+        worst_pair = "—"; top_loss_reason = "—"
+        if sl_rows:
+            pairs, reasons = {}, {}
+            for r in sl_rows:
+                p = ws.cell(r,2).value; pairs[p] = pairs.get(p,0)+1
+                rsn = ws.cell(r,14).value or ""; reasons[rsn] = reasons.get(rsn,0)+1
+            worst_pair = max(pairs, key=pairs.get)
+            top_loss_reason = max(reasons, key=reasons.get)
+        avg_tp_dur = "-"
+        if tp_rows:
+            durs = [float(ws.cell(r,12).value or 0) for r in tp_rows]
+            if durs: avg_tp_dur = f"{sum(durs)/len(durs):.0f}m"
+        msg = (f"<b>📊 تقرير كل ساعتين</b>\n"
+               f"إجمالي الإشارات: {total}\n"
+               f"نسبة الفوز: {wr:.0%} • إجمالي P/L: {total_pl:+.1f}%\n"
+               f"أسوأ زوج: <code>{worst_pair}</code>\n"
+               f"أكثر سبب دخول خسر: <i>{top_loss_reason}</i>\n"
+               f"متوسط مدة TP3: {avg_tp_dur}")
+        tg(msg)
+    except Exception as e:
+        logging.error(f"2h report err: {e}")
 
-def report_job():
-    if now().minute in {0, 2, 4}:
-        tg(diag_report(), key="diag", force=True)
-
-# ============================= MAIN LOOP (thread) =============================
+# =============== Bot Loop ===============
 def bot_loop():
-    logging.info("🚀 Bot loop started")
+    logging.info("🚀 Trading Bot v7+ started")
+    tg("🤖 <b>Bot Started • v7_plus</b>\n"
+       f"⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP}\n"
+       f"🛑 SL: max({SL_ATR_BASE}×ATR, خلف EMA50 بـ {SL_BEHIND_EMA50_ATR}×ATR)\n"
+       f"📈 شروط: EMA20/50 + Vol≥{VOL_SPIKE_MIN}× + ADX≥{ADX_MIN} • RR≥{MIN_RR}")
+
+    last_2h = time.time()
     while True:
         try:
-            if EX is None:
-                init_exchange_and_markets()
-            if EX is not None:
-                for s in scan():
-                    send(s)
-                for _ in range(max(1, SLEEP_BETWEEN // 5)):
-                    track()
-                    report_job()
-                    time.sleep(5)
-            else:
-                time.sleep(15)
+            picks = scan_cycle()
+            if picks and not entry_window_ok():
+                tg("⏳ لسنا في نافذة دخول (0:30–2:30 لكل شمعة 5م). تجاهلت الإشارات لهذه الدورة.")
+                picks = []
+            for s in picks:
+                send_signal(s)
+                time.sleep(2)
+
+            # tracking
+            for _ in range(max(1, SLEEP_BETWEEN // 5)):
+                track_cycle()
+                time.sleep(5)
+
+            # cycle diag
+            send_cycle_diag()
+
+            # every 2h
+            if time.time() - last_2h > 2*3600:
+                diag_report_2h()
+                last_2h = time.time()
+
         except Exception as e:
             logging.error(f"main loop err: {e}")
-            time.sleep(10)
+            time.sleep(5)
 
-# ============================= FASTAPI SERVER =============================
-try:
-    from fastapi import FastAPI
-    import uvicorn
+# =============== Web server (Render) ===============
+app = FastAPI()
 
-    app = FastAPI()
+@app.get("/")
+@app.get("/healthz")
+def health():
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
-    @app.get("/")
-    def root():
-        return {"ok": True, "exchange": EX_ID, "symbols": len(MARKET_SYMBOLS)}
-
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "time": now().isoformat(), "ex": EX_ID}
-
-    @app.post("/diag")
-    def diag():
-        return {"report": diag_report()}
-
-    def run_server():
-        port = int(os.getenv("PORT", "10000"))
-        uvicorn.run(app, host="0.0.0.0", port=port)
-
-    def start_bot_thread():
-        t = threading.Thread(target=bot_loop, daemon=True)
-        t.start()
-        return t
-
-    if __name__ == "__main__":
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-        tg("🤖 Bot Started - Unified (fallback+cache+throttle)", key="boot", force=True)
-        start_bot_thread()
-        run_server()
-
-except Exception as e:
+def run():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    logging.warning(f"FastAPI/uvicorn not available or failed ({e}), running bot loop directly.")
-    if __name__ == "__main__":
-        tg("🤖 Bot Started - Headless mode", key="boot", force=True)
-        bot_loop()
+    # bot thread
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+    # uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+if __name__ == "__main__":
+    run()
