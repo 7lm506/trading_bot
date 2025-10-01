@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Unified Trading Bot (Web Service + Background Loop)
-- Auto exchange fallback (default OKX), cache markets with TTL, throttle TG errors
+- Auto exchange fallback (default OKX), cache markets with TTL, TG error throttling
 - Strategy: recent EMA20-50 cross + Volume Spike ≥ 1.5x + momentum checks
 - Dynamic ATR targets: TP1=1.0×ATR, TP2=2.0×ATR, TP3=3.2×ATR | SL=0.8×ATR
 - Liquidity & spread filters, cooldown per symbol, Excel logging
 - FastAPI server binds to $PORT so Render free "Web Service" works
+!! تحذير: مفاتيح تيليجرام حساسة — لا تُشارك الملف علنًا.
 """
 
 import os, time, json, logging, threading, requests
@@ -14,16 +15,16 @@ import pandas as pd, numpy as np
 from openpyxl import Workbook, load_workbook
 import ccxt
 
-# ============================= ENV & DEFAULTS =============================
-TG_TOKEN   = os.getenv("TG_TOKEN")  # REQUIRED
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # REQUIRED
-if not TG_TOKEN or not TG_CHAT_ID:
-    raise RuntimeError("Please set TG_TOKEN and TG_CHAT_ID environment variables.")
+# ============================= TELEGRAM TOKEN / CHAT =============================
+# مدموجة مباشرة + يمكن تجاوزها بمتغيرات بيئة إن وُجدت
+TG_TOKEN   = os.getenv("TG_TOKEN")   or "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs"
+TG_CHAT_ID = os.getenv("TG_CHAT_ID") or "8429537293"  # اكتبها كنص
 
 API_URL = f"https://api.telegram.org/bot{TG_TOKEN}"
 
+# ============================= ENV & DEFAULTS =============================
 # Exchange selection
-MARKET_TYPE = os.getenv("MARKET_TYPE", "spot").strip().lower()  # 'spot' or 'swap'
+MARKET_TYPE = os.getenv("MARKET_TYPE", "spot").strip().lower()  # 'spot' أو 'swap'
 PRIMARY_EX  = os.getenv("EXCHANGE", "okx").strip().lower()
 FALLBACKS   = [x.strip().lower() for x in os.getenv("FALLBACKS", "bitget,mexc,gate,kucoin,kraken").split(",") if x.strip()]
 ALL_EX      = [PRIMARY_EX] + [x for x in FALLBACKS if x and x != PRIMARY_EX]
@@ -165,10 +166,9 @@ def _filter_symbols(mkts: dict) -> list[str]:
 
 def init_exchange_and_markets():
     global EX, EX_ID, MARKET_SYMBOLS
-    # Try cache first (to reduce noisy errors)
     cache = _load_markets_cache()
     tried = []
-    for ex_id in ALL_EX:
+    for ex_id in [x for x in ALL_EX if x]:
         try:
             ex = _build_exchange(ex_id)
             mkts = ex.load_markets()
@@ -184,12 +184,10 @@ def init_exchange_and_markets():
         except Exception as e:
             tried.append(ex_id)
             logging.error(f"init_exchange {ex_id} err: {e}")
-    # If all failed, but cache exists → use cache with the last known exchange id
     if cache and cache.get("symbols"):
         try:
             ex_id = cache.get("exchange", "okx")
             ex = _build_exchange(ex_id)
-            # NOTE: we still need load_markets() at least once for ccxt to map symbols → try lightly
             try:
                 ex.load_markets()
             except Exception as e:
@@ -200,7 +198,6 @@ def init_exchange_and_markets():
             return
         except Exception as e:
             logging.error(f"cache fallback err: {e}")
-    # Hard fail
     tg("⚠️ خطأ في تحميل قائمة العملات — سيتم إعادة المحاولة لاحقًا. (قد يكون حجب من البورصات)", key="mkts_error")
 
 # ============================= MARKET HELPERS =============================
@@ -252,7 +249,6 @@ def dollar_vol_last30(df: pd.DataFrame) -> float:
 # ============================= STRATEGY =============================
 def strat(sym: str, df: pd.DataFrame):
     c, h, l, v = df["c"], df["h"], df["l"], df["v"]
-    last = float(c.iloc[-1])
     e20, e50 = ema(c, 20), ema(c, 50)
     m_val = macd(c); m_sig = macd_sig(m_val)
     r14 = rsi(c)
@@ -315,17 +311,13 @@ cooldown: dict[str, float] = {}
 open_trades: dict[str, dict] = {}
 
 def _rank_symbols_by_volume(symbols: list[str]) -> list[str]:
-    # حاول fetch_tickers ثم فرز بـ quoteVolume، وإلا أعد القائمة كما هي
     tickers = fetch_tickers_safe()
     if not tickers:
         return symbols[:SCAN_TOP]
-    # ccxt: بعض البورصات تختلف في المفتاح؛ جرّب بأمان
     def _qv(sym):
         t = tickers.get(sym) or {}
-        # common fields
         vq = t.get("quoteVolume")
         if vq is None:
-            # fallback: baseVolume * last
             try:
                 bv = float(t.get("baseVolume") or 0)
                 last = float(t.get("last") or t.get("close") or 0)
@@ -346,7 +338,6 @@ def scan() -> list[dict]:
             return []
     picks = []
     symbols = _rank_symbols_by_volume(MARKET_SYMBOLS)
-    # حد أعلى للرموز لكل دورة حتى لا نكسر الريت ليمت
     symbols = symbols[:MAX_SCAN_PER_LOOP]
 
     for sym in symbols:
@@ -362,9 +353,7 @@ def scan() -> list[dict]:
             if spread_pct(sym) > MAX_SPREAD_PCT:
                 continue
 
-            # entry price من آخر إغلاق لتقليل اتصال آخر
             entry = float(df["c"].iloc[-1])
-
             side, meta = strat(sym, df)
             if side is None:
                 continue
@@ -388,7 +377,7 @@ def scan() -> list[dict]:
     return picks
 
 def send(sig: dict):
-    txt = (f"<b>🔥 توصية ذكية</b> • <i>{EX_ID.upper()}</i>\n"
+    txt = (f"<b>🔥 توصية ذكية</b> • <i>{EX_ID.upper() if EX_ID else ''}</i>\n"
            f"{'🚀 LONG' if sig['side']=='LONG' else '🔻 SHORT'} <code>{sig['symbol'].replace('/USDT:USDT','/USDT')}</code>\n"
            f"💰 Entry: <code>{sig['entry']}</code>\n"
            f"🎯 TP1: <code>{sig['tps'][0]}</code> | TP2: <code>{sig['tps'][1]}</code> | TP3: <code>{sig['tps'][2]}</code>\n"
@@ -436,7 +425,7 @@ def track():
             st["closed"] = True
             cooldown[sym] = time.time() + COOLDOWN_HOURS * 3600
 
-# ============================= DIAG REPORT (optional) =============================
+# ============================= DIAG REPORT =============================
 def diag_report() -> str:
     try:
         df = pd.read_excel(EXCEL, sheet_name="Signals")
@@ -464,7 +453,6 @@ def diag_report() -> str:
         return "تعذّر قراءة Excel."
 
 def report_job():
-    # أرسل تقرير كل ساعتين على رأس الساعة والساعة +2/+4 دقائق (خفيف)
     if now().minute in {0, 2, 4}:
         tg(diag_report(), key="diag", force=True)
 
@@ -483,14 +471,12 @@ def bot_loop():
                     report_job()
                     time.sleep(5)
             else:
-                # No exchange available, retry after short nap
                 time.sleep(15)
         except Exception as e:
             logging.error(f"main loop err: {e}")
             time.sleep(10)
 
 # ============================= FASTAPI SERVER =============================
-# يعمل كخدمة ويب على Render مع خيط الروبوت بالخلفية
 try:
     from fastapi import FastAPI
     import uvicorn
@@ -525,7 +511,6 @@ try:
         run_server()
 
 except Exception as e:
-    # FastAPI غير متوفر: شغل الروبوت كعملية foreground (مفيد محليًا)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logging.warning(f"FastAPI/uvicorn not available or failed ({e}), running bot loop directly.")
     if __name__ == "__main__":
