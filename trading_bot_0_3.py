@@ -1,13 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Trading Bot v7_plus (Render-ready, single file)
-- OKX swap/USDT + RateLimit/Backoff/Cache
-- Wider cross window + softer volume filters (configurable)
-- Telegram heartbeat + error alerts
-- Web server /healthz for Render
+Trading Bot v7_plus — Render single-file service
+- OKX swap/USDT + rate limit backoff/cache
+- Signal if: (recent EMA20/50 cross) OR (trend alignment + pullback + ADX strong)
+- Telegram heartbeat + diagnostics
+- Web /healthz to keep service awake
+
+Environment overrides you can set on Render:
+TIMEFRAME=5m
+SCAN_TOP=120
+MIN_DOLLAR_VOLUME=250000
+VOL_SPIKE_MIN=1.1
+ADX_MIN=18
+CROSS_MAX_AGE=12
+CROSS_MODE=recent_or_alignment   # values: "recent_only" | "recent_or_alignment"
+USE_ENTRY_WINDOW=off             # values: "on" | "off"
+EXTENSION_MAX_ATR=1.2
+OHLCV_SLEEP_MIN_S=0.5
+OHLCV_SLEEP_MAX_S=0.9
+DIAG_EVERY_MIN=10
+HEARTBEAT_EVERY_MIN=30
 """
 
-import os, time, math, random, logging, threading, requests
+import os, time, random, logging, threading, requests
 from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
@@ -16,14 +31,13 @@ import ccxt
 from fastapi import FastAPI
 import uvicorn
 
-# =============== Telegram ===============
+# ---------- Telegram ----------
 TG_TOKEN   = os.getenv("TG_TOKEN",   "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs")
 TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "8429537293"))
 TG_API     = f"https://api.telegram.org/bot{TG_TOKEN}"
-
 _last_tg_err = 0
+
 def tg(text: str):
-    """send telegram with light throttling on errors"""
     global _last_tg_err
     try:
         requests.post(f"{TG_API}/sendMessage",
@@ -35,31 +49,32 @@ def tg(text: str):
             logging.error(f"TG err: {e}")
             _last_tg_err = now
 
-# =============== Config (env override) ===============
+# ---------- Config (env) ----------
 TIMEFRAME          = os.getenv("TIMEFRAME", "5m")
 BARS               = int(os.getenv("BARS", "500"))
 SCAN_TOP           = int(os.getenv("SCAN_TOP", "120"))
-SLEEP_BETWEEN      = int(os.getenv("SLEEP_BETWEEN", "60"))   # دقيقة بين الدورات
-MIN_DOLLAR_VOLUME  = float(os.getenv("MIN_DOLLAR_VOLUME", "300000"))  # على آخر 30 شمعة 5م
+SLEEP_BETWEEN      = int(os.getenv("SLEEP_BETWEEN", "60"))
+
+MIN_DOLLAR_VOLUME  = float(os.getenv("MIN_DOLLAR_VOLUME", "250000"))   # last 30 bars
 MAX_SPREAD_PCT     = float(os.getenv("MAX_SPREAD_PCT", str(0.20/100)))
 COOLDOWN_HOURS     = float(os.getenv("COOLDOWN_HOURS", "3"))
 MIN_RR             = float(os.getenv("MIN_RR", "1.18"))
 ADX_MIN            = float(os.getenv("ADX_MIN", "18"))
-VOL_SPIKE_MIN      = float(os.getenv("VOL_SPIKE_MIN", "1.2"))
+VOL_SPIKE_MIN      = float(os.getenv("VOL_SPIKE_MIN", "1.1"))
 EXTENSION_MAX_ATR  = float(os.getenv("EXTENSION_MAX_ATR", "1.2"))
-CROSS_MAX_AGE      = int(os.getenv("CROSS_MAX_AGE", "12"))   # عدد الشمعات المسموح تقاطع خلالها
+CROSS_MAX_AGE      = int(os.getenv("CROSS_MAX_AGE", "12"))
+CROSS_MODE         = os.getenv("CROSS_MODE", "recent_or_alignment")  # "recent_only" | "recent_or_alignment"
+USE_ENTRY_WINDOW   = os.getenv("USE_ENTRY_WINDOW", "off").lower()    # "on" | "off"
 
 ATR_MULT_TP        = (1.0, 2.0, 3.2)
 SL_ATR_BASE        = 1.25
 SL_BEHIND_EMA50_ATR= 0.35
 
-# Rate limit / backoff
-OHLCV_SLEEP_MIN_S  = float(os.getenv("OHLCV_SLEEP_MIN_S", "0.45"))
-OHLCV_SLEEP_MAX_S  = float(os.getenv("OHLCV_SLEEP_MAX_S", "0.75"))
+OHLCV_SLEEP_MIN_S  = float(os.getenv("OHLCV_SLEEP_MIN_S", "0.5"))
+OHLCV_SLEEP_MAX_S  = float(os.getenv("OHLCV_SLEEP_MAX_S", "0.9"))
 OHLCV_CACHE_TTL_S  = int(os.getenv("OHLCV_CACHE_TTL_S", "30"))
 TICKERS_TTL_S      = int(os.getenv("TICKERS_TTL_S", "60"))
 
-# Reporting cadences
 DIAG_EVERY_MIN       = int(os.getenv("DIAG_EVERY_MIN", "10"))
 HEARTBEAT_EVERY_MIN  = int(os.getenv("HEARTBEAT_EVERY_MIN", "30"))
 
@@ -80,7 +95,7 @@ def init_excels():
         wb.save(REJ_XLSX)
 init_excels()
 
-def xl_append_signal(sig: dict, res: str, exit_t: str, dur_min: float, pl_pct: float, exit_rsn: str):
+def xl_append_signal(sig, res, exit_t, dur_min, pl_pct, exit_rsn):
     try:
         wb = load_workbook(SIG_XLSX); ws = wb.active
         ws.append([ws.max_row,
@@ -92,40 +107,31 @@ def xl_append_signal(sig: dict, res: str, exit_t: str, dur_min: float, pl_pct: f
     except Exception as e:
         logging.error(f"XL signal err: {e}")
 
-def xl_append_reject(sym: str, reason: str, adx: float|None, vsp: float|None, ext: float|None, spr: float|None, dvol: float|None):
+def xl_append_reject(sym, reason, adx=None, vsp=None, ext=None, spr=None, dvol=None):
     try:
         wb = load_workbook(REJ_XLSX); ws = wb.active
         ws.append([ws.max_row, sym.replace("/USDT:USDT","/USDT"), reason,
-                   round(adx or 0,1), round(vsp or 0,2), round(ext or 0,2), round((spr or 0)*100,3),
-                   round(dvol or 0,0), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")])
+                   round(adx or 0,1), round(vsp or 0,2), round(ext or 0,2),
+                   round((spr or 0)*100,3), round(dvol or 0,0),
+                   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")])
         wb.save(REJ_XLSX)
     except Exception as e:
         logging.error(f"XL reject err: {e}")
 
-# =============== Exchange ===============
+# ---------- Exchange ----------
 def init_exchange_okx():
     ex = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 25000,
         "options": {"defaultType": "swap"},  # USDT perps
     })
+    ex.load_markets()
     return ex
 
-ex = None
-def ensure_exchange():
-    global ex
-    if ex is None:
-        try:
-            _ex = init_exchange_okx()
-            _ex.load_markets()
-            ex = _ex
-            logging.info("✅ Using exchange: okx")
-        except Exception as e:
-            logging.error(f"init okx failed: {e}")
-            raise
-ensure_exchange()
+ex = init_exchange_okx()
+logging.info("✅ Using exchange: okx")
 
-# =============== Caches & Guards ===============
+# ---------- Cache / Backoff ----------
 tickers_cache = {"ts": 0, "data": {}}
 ohlcv_cache   = {}  # sym -> {"ts": epoch, "df": DataFrame}
 
@@ -133,7 +139,7 @@ def sleep_jitter():
     time.sleep(random.uniform(OHLCV_SLEEP_MIN_S, OHLCV_SLEEP_MAX_S))
 
 def backoff_sleep(attempt):
-    time.sleep(0.6 * (2 ** max(0, attempt-1)))  # 0.6,1.2,2.4,4.8,...
+    time.sleep(0.6 * (2 ** max(0, attempt-1)))  # 0.6,1.2,2.4,4.8...
 
 def fetch_tickers_cached():
     now = time.time()
@@ -153,11 +159,11 @@ def fetch_ohlcv_with_backoff(sym, timeframe, limit):
     last_err = None
     for attempt in range(1, 6):
         try:
-            df_raw = ex.fetch_ohlcv(sym, timeframe, limit=limit)
-            if not df_raw or len(df_raw) < 200:
+            rows = ex.fetch_ohlcv(sym, timeframe, limit=limit)
+            if not rows or len(rows) < 200:
                 last_err = Exception("empty ohlcv")
                 backoff_sleep(attempt); continue
-            df = pd.DataFrame(df_raw, columns=["ts","o","h","l","c","v"])
+            df = pd.DataFrame(rows, columns=["ts","o","h","l","c","v"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
             for col in ["o","h","l","c","v"]:
                 df[col] = df[col].astype(float)
@@ -177,7 +183,7 @@ def fetch_ohlcv_with_backoff(sym, timeframe, limit):
             last_err = e; logging.error(f"ohlcv err {sym}: {e}"); sleep_jitter()
     raise last_err or Exception("ohlcv failed")
 
-# =============== TA ===============
+# ---------- TA ----------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def rsi(s, n=14):
     d = s.diff(); up, dn = np.maximum(d,0), np.maximum(-d,0)
@@ -196,7 +202,7 @@ def adx(h, l, c, n=14):
     dx  = 100 * (abs(pdi - mdi) / (pdi + mdi + 1e-12))
     return dx.ewm(span=n, adjust=False).mean(), pdi, mdi
 
-# =============== Market utils ===============
+# ---------- Market utils ----------
 def last_price(sym):
     try:
         return float(ex.fetch_ticker(sym)["last"])
@@ -235,8 +241,9 @@ def top_symbols(limit=SCAN_TOP):
     syms.sort(key=lambda s: qv(ticks.get(s, {})), reverse=True)
     return syms[:limit]
 
-# =============== Strategy ===============
+# ---------- Strategy ----------
 reject_counter = {}
+
 def strat(sym, df):
     c,h,l,v = df["c"], df["h"], df["l"], df["v"]
     last = float(c.iloc[-1])
@@ -244,9 +251,13 @@ def strat(sym, df):
     atr14 = float(atr(h,l,c).iloc[-1])
     adx14, _, _ = adx(h,l,c)
     adx_cur = float(adx14.iloc[-1])
-    vsp = float(v.iloc[-1] / (v.rolling(20).median().iloc[-1] + 1e-12))
 
-    # trend
+    # volume spike now or recent (last 5 bars)
+    v_med = v.rolling(20).median().iloc[-1] + 1e-12
+    vsp_now = float(v.iloc[-1] / v_med)
+    vsp_5   = float(v.iloc[-5:].max() / v_med)
+
+    # trend side
     if e20.iloc[-1] > e50.iloc[-1]:
         side = "LONG"
     elif e20.iloc[-1] < e50.iloc[-1]:
@@ -254,31 +265,43 @@ def strat(sym, df):
     else:
         return None, {"reasons":["no_trend"], "atr":atr14}
 
-    # recent cross window (configurable)
+    # recent cross?
     def crossed_recent(f, s, side):
         for i in range(1, CROSS_MAX_AGE+1):
             prev_ok = f.iloc[-i-1] <= s.iloc[-i-1] if side=="LONG" else f.iloc[-i-1] >= s.iloc[-i-1]
             now_ok  = f.iloc[-i]   >  s.iloc[-i]   if side=="LONG" else f.iloc[-i]   <  s.iloc[-i]
             if prev_ok and now_ok: return True, i
         return False, None
-
     cross_ok, cross_age = crossed_recent(e20, e50, side)
-    if not cross_ok:
-        return None, {"reasons":["no_recent_cross"], "atr":atr14}
 
-    if vsp < VOL_SPIKE_MIN:
-        return None, {"reasons":[f"low_vol_{vsp:.1f}x"], "atr":atr14}
-
-    if adx_cur < ADX_MIN:
-        return None, {"reasons":[f"weak_adx_{int(adx_cur)}"], "atr":atr14}
-
-    # anti-chase
+    # extension from ema20 (anti-chase)
     ext_atr = abs(last - e20.iloc[-1]) / (atr14 + 1e-12)
     if ext_atr > EXTENSION_MAX_ATR:
         return None, {"reasons":["extended_from_ema20"], "atr":atr14}
 
-    # confirm candle with trend
-    if side=="LONG" and not (c.iloc[-1] > c.iloc[-2]): 
+    # alignment path: allow if no recent cross but trend aligned + ADX strong + pullback near ema20 + recent vol spike
+    alignment_ok = False
+    if CROSS_MODE != "recent_only" and not cross_ok:
+        strong_adx = adx_cur >= max(ADX_MIN+5, 23)   # أقوى شوي من الحد الأدنى
+        near_ema20 = ext_atr <= 0.6                  # ارتداد قريب من EMA20
+        vol_ok     = max(vsp_now, vsp_5) >= VOL_SPIKE_MIN
+        with_trend_candle = (c.iloc[-1] > c.iloc[-2]) if side=="LONG" else (c.iloc[-1] < c.iloc[-2])
+        chain = [
+            (e20.iloc[-1] > e50.iloc[-1]) if side=="LONG" else (e20.iloc[-1] < e50.iloc[-1]),
+            strong_adx, near_ema20, vol_ok, with_trend_candle
+        ]
+        alignment_ok = all(chain)
+
+    # if neither recent cross nor alignment -> reject
+    if not cross_ok and not alignment_ok:
+        return None, {"reasons":["no_recent_cross"], "atr":atr14}
+
+    # ADX base threshold
+    if adx_cur < ADX_MIN:
+        return None, {"reasons":[f"weak_adx_{int(adx_cur)}"], "atr":atr14}
+
+    # confirm candle
+    if side=="LONG" and not (c.iloc[-1] > c.iloc[-2]):
         return None, {"reasons":["no_confirm_long"], "atr":atr14}
     if side=="SHORT" and not (c.iloc[-1] < c.iloc[-2]):
         return None, {"reasons":["no_confirm_short"], "atr":atr14}
@@ -288,8 +311,17 @@ def strat(sym, df):
     if (side=="LONG" and r>=70) or (side=="SHORT" and r<=30):
         return None, {"reasons":[f"rsi_extreme_{int(r)}"], "atr":atr14}
 
-    reasons = [f"ema20/50_cross_{cross_age}c", f"vol_spike_{vsp:.1f}x",
-               f"adx_{int(adx_cur)}", "confirm_candle", "rsi_ok"]
+    # final volume check (use recent window)
+    if max(vsp_now, vsp_5) < VOL_SPIKE_MIN:
+        return None, {"reasons":[f"low_vol_{max(vsp_now, vsp_5):.1f}x"], "atr":atr14}
+
+    reasons = []
+    if cross_ok:
+        reasons.append(f"ema20/50_cross_{cross_age}c")
+    else:
+        reasons.append("alignment_adx_pullback")
+
+    reasons += [f"vol_spike_{max(vsp_now,vsp_5):.1f}x", f"adx_{int(adx_cur)}", "confirm_candle", "rsi_ok"]
     return side, {"atr":atr14, "reasons": reasons}
 
 def build_sl(entry, side, atr_val, ema50_last):
@@ -308,13 +340,16 @@ def targets(entry, atr_val, side):
         return [round(entry - m1*atr_val,6), round(entry - m2*atr_val,6), round(entry - m3*atr_val,6)]
 
 def entry_window_ok():
+    if USE_ENTRY_WINDOW != "on":
+        return True
+    # strict window: 0:30–2:30 of each 5m candle
     now = datetime.now(timezone.utc)
     sec = (now.minute % 5)*60 + now.second
     return 30 <= sec <= 150
 
-# =============== Scan/Send/Track ===============
-cooldown    = {}   # sym -> epoch
-open_trades = {}   # sym -> state
+# ---------- Scan/Send/Track ----------
+cooldown    = {}
+open_trades = {}
 _last_diag  = 0
 _last_hb    = 0
 
@@ -347,7 +382,6 @@ def scan_cycle():
                 continue
 
             lp = float(df["c"].iloc[-1])
-
             side, meta = strat(sym, df)
             if side is None:
                 reason = (meta.get("reasons") or ["unknown"])[0]
@@ -372,9 +406,13 @@ def scan_cycle():
                 "state": "OPEN", "tp_stage": 0,
                 "last_bar_time": int(df["ts"].iloc[-1].timestamp())
             })
+
+            if len(picks) >= 2:   # حد أقصى إشارتين/دورة
+                break
+
         except Exception as e:
             logging.error(f"scan {sym}: {e}")
-    return picks[:2]
+    return picks
 
 def send_signal(sig):
     emoji = "🚀" if sig["side"]=="LONG" else "🔻"
@@ -465,6 +503,8 @@ def track_cycle():
             elif lp <= tps[2]:
                 res_exit(sym, st, "TP3", lp, "Target 3 🎯")
 
+# ---------- Bot loop ----------
+_last_hb = 0
 def heartbeat_if_due():
     global _last_hb
     now = time.time()
@@ -477,7 +517,6 @@ def heartbeat_if_due():
        f"Diag كل {DIAG_EVERY_MIN}m • HB كل {HEARTBEAT_EVERY_MIN}m")
     _last_hb = now
 
-# =============== Bot Loop ===============
 def bot_loop():
     logging.info("🚀 Trading Bot v7+ started")
     tg("🤖 <b>Bot Started • v7_plus</b>\n"
@@ -489,25 +528,21 @@ def bot_loop():
         try:
             picks = scan_cycle()
             if picks and not entry_window_ok():
-                tg("⏳ لسنا في نافذة دخول (0:30–2:30 لكل شمعة 5م). تجاهلت الإشارات لهذه الدورة.")
+                tg("⏳ نافذة الدخول مغلّقة (فعّلت USE_ENTRY_WINDOW=on). تجاهلت الإشارات لهذه الدورة.")
                 picks = []
             for s in picks:
                 send_signal(s); time.sleep(2)
-
-            # tracking
             for _ in range(max(1, SLEEP_BETWEEN // 5)):
                 track_cycle()
                 time.sleep(5)
-
             send_cycle_diag_if_due()
             heartbeat_if_due()
-
         except Exception as e:
             logging.error(f"main loop err: {e}")
-            tg(f"⚠️ Runtime error: <code>{str(e)[:180]}</code>")
+            tg(f"⚠️ Runtime error: <code>{str(e)[:200]}</code>")
             time.sleep(5)
 
-# =============== Web server (Render) ===============
+# ---------- Web (Render) ----------
 app = FastAPI()
 
 @app.get("/")
