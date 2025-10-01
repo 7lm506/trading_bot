@@ -4,3 +4,4 @@ numpy
 requests
 fastapi
 uvicorn
+openpyxl>=3.1.2
