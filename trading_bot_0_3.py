@@ -1,14 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-Trading Bot • v7_plus (Render single-file)
-حل عملي لمشكلتينك: (1) OKX 50011 Rate Limit (2) قلة الإشارات بسبب no_recent_cross
-- RateLimit: منظم طلبات عالمي + Backoff + Cache + Jitter + تبطيء ذاتي عند 50011
-- Strategy: recent cross أو alignment (ترند متسق + ADX قوي + ارتداد قريب من EMA20 + حجم)
-- Scout Mode: إذا كثرت أسباب الرفض، نرخي الحدود دورة واحدة بشكل آمن
-- Web /healthz + Telegram Heartbeat/Diag
+trading_bot_0_3.py  —  v7_plus (Render, single-file)
+
+• OKX فقط (لتجاوز حجب Binance/Bybit) + RateLimiter قوي + Cache + Jitter + Backoff
+• Scan على دفعات مع تدوير (Rotating Batches) حتى لا نضرب Rate-Limit: 120 زوج يتم تغطيتها على دفعات صغيرة
+• إستراتيجية v7_plus:
+    - recent EMA20/50 cross (حتى 12 شمعة) أو alignment (ADX قوي + ارتداد قريب من EMA20 + حجم)
+    - منع مطاردة السعر: امتداد عن EMA20 ≤ 1.2×ATR (يسترخي قليلاً تلقائيًا عند كثرة الرفض)
+    - SL: max(1.25×ATR, خلف EMA50 بـ 0.35×ATR)
+    - TP: 1.0, 2.0, 3.2 × ATR، بعد TP1: SL→BE، بعد TP2: تتبع EMA20
+• Heartbeat ثابت + Diag دوري حتى لو لا توجد توصيات
+• /healthz لإبقاء الخدمة حيّة، مع Self-Ping داخلي قابل للتعطيل
+
+بيئة مفيدة (Render → Environment):
+  TG_TOKEN, TG_CHAT_ID
+  TIMEFRAME=5m
+  SCAN_TOP=120
+  SCAN_BATCH=35          # حجم الدفعة لكل دورة
+  SLEEP_BETWEEN=60       # ثواني بين الدورات
+  MIN_DOLLAR_VOLUME=200000
+  VOL_SPIKE_MIN=1.1
+  REQ_MIN_INTERVAL_S=1.0 # لو بقي 50011 ارفعها تدريجياً
+  OHLCV_CACHE_TTL_S=60
+  TICKERS_TTL_S=600
+  USE_ENTRY_WINDOW=off
+  KEEPALIVE=on           # Self-Ping /healthz كل 4 دقائق
 """
 
-import os, time, random, logging, threading, requests
+import os, time, random, logging, threading, requests, signal
 from datetime import datetime, timezone
 import pandas as pd, numpy as np
 from openpyxl import Workbook, load_workbook
@@ -16,7 +35,7 @@ import ccxt
 from fastapi import FastAPI
 import uvicorn
 
-# ========= Telegram (يمكنك تركهم كـ env) =========
+# ========= Telegram =========
 TG_TOKEN   = os.getenv("TG_TOKEN",   "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs")
 TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "8429537293"))
 TG_API     = f"https://api.telegram.org/bot{TG_TOKEN}"
@@ -29,14 +48,15 @@ def tg(text: str):
     except Exception as e:
         logging.error(f"TG err: {e}")
 
-# ========= إعدادات عامة (قابلة للتعديل بالبيئة) =========
+# ========= إعدادات عامة =========
 TIMEFRAME           = os.getenv("TIMEFRAME", "5m")
 BARS                = int(os.getenv("BARS", "500"))
-SCAN_TOP            = int(os.getenv("SCAN_TOP", "120"))
-MAX_SIGNALS_CYCLE   = int(os.getenv("MAX_SIGNALS_CYCLE", "3"))
+
+SCAN_TOP            = int(os.getenv("SCAN_TOP", "120"))     # إجمالي الكون
+SCAN_BATCH          = int(os.getenv("SCAN_BATCH", "35"))    # الدفعة لكل دورة
 SLEEP_BETWEEN       = int(os.getenv("SLEEP_BETWEEN", "60"))
 
-MIN_DOLLAR_VOLUME   = float(os.getenv("MIN_DOLLAR_VOLUME", "200000"))  # مجموع (Close*Vol) لآخر 30 شمعة
+MIN_DOLLAR_VOLUME   = float(os.getenv("MIN_DOLLAR_VOLUME", "200000"))
 MAX_SPREAD_PCT      = float(os.getenv("MAX_SPREAD_PCT", str(0.20/100)))
 COOLDOWN_HOURS      = float(os.getenv("COOLDOWN_HOURS", "2.5"))
 MIN_RR              = float(os.getenv("MIN_RR", "1.18"))
@@ -44,25 +64,28 @@ ADX_MIN             = float(os.getenv("ADX_MIN", "18"))
 VOL_SPIKE_MIN       = float(os.getenv("VOL_SPIKE_MIN", "1.1"))
 EXTENSION_MAX_ATR   = float(os.getenv("EXTENSION_MAX_ATR", "1.2"))
 CROSS_MAX_AGE       = int(os.getenv("CROSS_MAX_AGE", "12"))
-CROSS_MODE          = os.getenv("CROSS_MODE", "recent_or_alignment")  # or "recent_only"
-USE_ENTRY_WINDOW    = os.getenv("USE_ENTRY_WINDOW", "off").lower()    # "on" | "off"
+CROSS_MODE          = os.getenv("CROSS_MODE", "recent_or_alignment")  # أو recent_only
+USE_ENTRY_WINDOW    = os.getenv("USE_ENTRY_WINDOW", "off").lower()    # on/off
 
 # إدارة المخاطر
 ATR_MULT_TP         = (1.0, 2.0, 3.2)
 SL_ATR_BASE         = 1.25
 SL_BEHIND_EMA50_ATR = 0.35
 
-# مكافحة الـ Rate Limit
-REQ_MIN_INTERVAL_S  = float(os.getenv("REQ_MIN_INTERVAL_S", "0.85"))  # بين أي طلبين CCXT
+# مكافحة Rate Limit
+REQ_MIN_INTERVAL_S  = float(os.getenv("REQ_MIN_INTERVAL_S", "1.0"))
 BACKOFF_BASE_S      = float(os.getenv("BACKOFF_BASE_S", "0.8"))
-OHLCV_CACHE_TTL_S   = int(os.getenv("OHLCV_CACHE_TTL_S", "45"))
-TICKERS_TTL_S       = int(os.getenv("TICKERS_TTL_S", "300"))
+OHLCV_CACHE_TTL_S   = int(os.getenv("OHLCV_CACHE_TTL_S", "60"))
+TICKERS_TTL_S       = int(os.getenv("TICKERS_TTL_S", "600"))
 JITTER_MIN_S        = float(os.getenv("JITTER_MIN_S", "0.25"))
 JITTER_MAX_S        = float(os.getenv("JITTER_MAX_S", "0.6"))
 
 # نبض وتشخيص
 DIAG_EVERY_MIN      = int(os.getenv("DIAG_EVERY_MIN", "10"))
 HEARTBEAT_EVERY_MIN = int(os.getenv("HEARTBEAT_EVERY_MIN", "30"))
+
+# Self Ping
+KEEPALIVE           = os.getenv("KEEPALIVE", "on").lower()  # on/off
 
 # ========= ملفات Excel =========
 BASE_DIR = os.path.dirname(__file__)
@@ -105,12 +128,12 @@ def xl_append_reject(sym, reason, adx=None, vsp=None, ext=None, spr=None, dvol=N
     except Exception as e:
         logging.error(f"XL reject err: {e}")
 
-# ========= OKX Exchange =========
+# ========= OKX =========
 def init_okx():
     ex = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 25000,
-        "options": {"defaultType": "swap"}, # USDT Perps
+        "options": {"defaultType": "swap"},
     })
     ex.load_markets()
     return ex
@@ -118,16 +141,16 @@ def init_okx():
 ex = init_okx()
 logging.info("✅ Using OKX swap/USDT")
 
-# ========= طلبات محكومة (Token-Bucket) =========
+# ========= RateLimiter + Cache =========
 _last_req_ts = 0.0
-_global_penalty_s = 0.0              # يكبر مؤقتًا بعد 50011
-_symbol_penalty = {}                 # لكل رمز
+_global_penalty_s = 0.0
+_symbol_penalty = {}
+tickers_cache = {"ts": 0, "data": {}}
+ohlcv_cache   = {}  # sym -> {"ts": epoch, "df": DataFrame}
 
 def _guard_rate(symbol=None):
     global _last_req_ts
-    wait = REQ_MIN_INTERVAL_S + _global_penalty_s
-    if symbol:
-        wait += _symbol_penalty.get(symbol, 0.0)
+    wait = REQ_MIN_INTERVAL_S + _global_penalty_s + ( _symbol_penalty.get(symbol, 0.0) if symbol else 0.0 )
     delta = time.time() - _last_req_ts
     if delta < wait:
         time.sleep(wait - delta)
@@ -135,7 +158,7 @@ def _guard_rate(symbol=None):
 
 def _penalize(symbol=None, attempt=1):
     global _global_penalty_s
-    _global_penalty_s = min(5.0, BACKOFF_BASE_S * (2 ** max(0, attempt-1)))
+    _global_penalty_s = min(6.0, BACKOFF_BASE_S * (2 ** max(0, attempt-1)))
     if symbol:
         _symbol_penalty[symbol] = min(3.0, _symbol_penalty.get(symbol, 0.0) + 0.6)
 
@@ -147,9 +170,6 @@ def _relax_penalty(symbol=None):
 
 def _jitter():
     time.sleep(random.uniform(JITTER_MIN_S, JITTER_MAX_S))
-
-tickers_cache = {"ts": 0, "data": {}}
-ohlcv_cache   = {}   # sym -> {"ts": epoch, "df": DataFrame}
 
 def fetch_tickers_cached():
     now = time.time()
@@ -163,11 +183,10 @@ def fetch_tickers_cached():
             _relax_penalty()
             return data
         except ccxt.RateLimitExceeded as e:
-            logging.error(f"rate limit tickers: {e}")
-            _penalize(attempt=attempt); continue
+            logging.error(f"rate limit tickers: {e}"); _penalize(attempt=attempt)
         except Exception as e:
             logging.error(f"tickers err: {e}"); time.sleep(1.2)
-    return {}  # نرجع فاضي ونستخدم القائمة الاحتياطية
+    return {}
 
 def fetch_ohlcv(symbol, timeframe, limit):
     now = time.time()
@@ -197,8 +216,7 @@ def fetch_ohlcv(symbol, timeframe, limit):
                 logging.error(f"OKX 50011 {symbol} attempt {attempt}")
                 _penalize(symbol, attempt)
             else:
-                logging.error(f"ex err {symbol}: {e}")
-                _jitter()
+                logging.error(f"ex err {symbol}: {e}"); _jitter()
         except Exception as e:
             last_err = e; logging.error(f"ohlcv err {symbol}: {e}"); _jitter()
     raise last_err or Exception("ohlcv failed")
@@ -210,8 +228,7 @@ def last_price(symbol):
         _relax_penalty(symbol)
         return float(t["last"])
     except Exception:
-        _penalize(symbol, 1)
-        return None
+        _penalize(symbol, 1); return None
 
 def spread_pct(symbol):
     try:
@@ -221,10 +238,9 @@ def spread_pct(symbol):
         bid, ask = ob["bids"][0][0], ob["asks"][0][0]
         return (ask - bid) / ask if ask else 1.0
     except Exception:
-        _penalize(symbol, 1)
-        return 1.0
+        _penalize(symbol, 1); return 1.0
 
-# قائمة احتياطية لأشهر USDT Perps على OKX
+# ========= Universe =========
 FALLBACK_UNIVERSE = [
     "BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","BNB/USDT:USDT","XRP/USDT:USDT",
     "DOGE/USDT:USDT","ADA/USDT:USDT","TON/USDT:USDT","LINK/USDT:USDT","AVAX/USDT:USDT",
@@ -236,7 +252,7 @@ FALLBACK_UNIVERSE = [
     "KAS/USDT:USDT","TRX/USDT:USDT","FET/USDT:USDT","ENS/USDT:USDT","RUNE/USDT:USDT",
 ]
 
-def top_symbols(limit=SCAN_TOP):
+def top_symbols(limit):
     data = fetch_tickers_cached()
     syms = []
     for s, m in ex.markets.items():
@@ -245,7 +261,6 @@ def top_symbols(limit=SCAN_TOP):
         if m.get("quote") != "USDT": continue
         syms.append(s)
     if not data:
-        # fallback: نرجّح القائمة الاحتياطية ثم نكمل من الباقي
         pref = [s for s in FALLBACK_UNIVERSE if s in syms]
         rest = [s for s in syms if s not in pref]
         return (pref + rest)[:limit]
@@ -255,12 +270,11 @@ def top_symbols(limit=SCAN_TOP):
         v = t.get("quoteVolume") or t.get("baseVolume")
         if v: return float(v or 0)
         info = t.get("info") or {}
-        # OKX يعرض volCcy24h أحيانًا
         return float(info.get("volCcy24h") or 0)
     syms.sort(key=lambda s: qv(data.get(s, {})), reverse=True)
     return syms[:limit]
 
-# ========= المؤشرات الفنيّة =========
+# ========= المؤشرات =========
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def rsi(s, n=14):
     d = s.diff(); up, dn = np.maximum(d,0), np.maximum(-d,0)
@@ -288,18 +302,15 @@ def strat(sym, df, scout=False):
     adx14, _, _ = adx(h,l,c)
     adx_cur = float(adx14.iloc[-1])
 
-    # حجم: لحظة/آخر 5 شمعات
     v_med = v.rolling(20).median().iloc[-1] + 1e-12
     vsp_now = float(v.iloc[-1] / v_med)
     vsp_5   = float(v.iloc[-5:].max() / v_med)
     vsp = max(vsp_now, vsp_5)
 
-    # اتجاه
     side = "LONG" if e20.iloc[-1] > e50.iloc[-1] else "SHORT" if e20.iloc[-1] < e50.iloc[-1] else None
     if not side:
         return None, {"reasons":["no_trend"], "atr":atr14}
 
-    # تقاطع حديث؟
     def crossed_recent(f, s, side, max_age=CROSS_MAX_AGE):
         for i in range(1, max_age+1):
             prev_ok = f.iloc[-i-1] <= s.iloc[-i-1] if side=="LONG" else f.iloc[-i-1] >= s.iloc[-i-1]
@@ -308,13 +319,11 @@ def strat(sym, df, scout=False):
         return False, None
     cross_ok, cross_age = crossed_recent(e20, e50, side)
 
-    # امتداد عن EMA20
     ext_atr = abs(last - e20.iloc[-1]) / (atr14 + 1e-12)
     ext_limit = 1.5 if scout else EXTENSION_MAX_ATR
     if ext_atr > ext_limit:
         return None, {"reasons":["extended_from_ema20"], "atr":atr14}
 
-    # alignment path (إذا ما فيه cross)
     alignment_ok = False
     if CROSS_MODE != "recent_only" and not cross_ok:
         strong_adx = adx_cur >= (max(ADX_MIN+5, 23) if not scout else max(ADX_MIN+3, 21))
@@ -326,20 +335,16 @@ def strat(sym, df, scout=False):
     if not cross_ok and not alignment_ok:
         return None, {"reasons":["no_recent_cross"], "atr":atr14}
 
-    # ADX أساسي
     if adx_cur < ADX_MIN:
         return None, {"reasons":[f"adx_{int(adx_cur)}"], "atr":atr14}
 
-    # شمعة تأكيد
     if side=="LONG" and not (c.iloc[-1] > c.iloc[-2]):  return None, {"reasons":["no_confirm_long"], "atr":atr14}
     if side=="SHORT" and not (c.iloc[-1] < c.iloc[-2]): return None, {"reasons":["no_confirm_short"], "atr":atr14}
 
-    # RSI حدّي
     r = float(rsi(c).iloc[-1])
     if (side=="LONG" and r>=71) or (side=="SHORT" and r<=29):
         return None, {"reasons":[f"rsi_extreme_{int(r)}"], "atr":atr14}
 
-    # حجم نهائي
     if vsp < (VOL_SPIKE_MIN if not scout else max(1.0, VOL_SPIKE_MIN-0.1)):
         return None, {"reasons":[f"low_vol_{vsp:.1f}x"], "atr":atr14}
 
@@ -350,11 +355,9 @@ def strat(sym, df, scout=False):
 
 def build_sl(entry, side, atr_val, ema50_last):
     if side=="LONG":
-        return round(min(entry - SL_ATR_BASE*atr_val,
-                         ema50_last - SL_BEHIND_EMA50_ATR*atr_val), 6)
+        return round(min(entry - SL_ATR_BASE*atr_val, ema50_last - SL_BEHIND_EMA50_ATR*atr_val), 6)
     else:
-        return round(max(entry + SL_ATR_BASE*atr_val,
-                         ema50_last + SL_BEHIND_EMA50_ATR*atr_val), 6)
+        return round(max(entry + SL_ATR_BASE*atr_val, ema50_last + SL_BEHIND_EMA50_ATR*atr_val), 6)
 
 def targets(entry, atr_val, side):
     m1, m2, m3 = ATR_MULT_TP
@@ -373,27 +376,39 @@ def entry_window_ok():
     sec = (now.minute % 5)*60 + now.second
     return 30 <= sec <= 150
 
-# ========= Scan / Send / Track =========
-cooldown     = {}    # symbol -> unix time
-open_trades  = {}    # symbol -> state dict
-reject_count = {}    # لأسباب الرفض
+# ========= Scan/Send/Track =========
+cooldown     = {}
+open_trades  = {}
+reject_count = {}
 _last_diag   = 0
 _last_hb     = 0
+_scan_cursor = 0  # لتدوير الدُفعات
+
+def _current_batch_symbols(all_syms):
+    global _scan_cursor
+    if not all_syms: return []
+    step = max(1, SCAN_BATCH)
+    start = (_scan_cursor * step) % len(all_syms)
+    end   = min(len(all_syms), start + step)
+    batch = all_syms[start:end]
+    _scan_cursor = (_scan_cursor + 1) % max(1, (len(all_syms)+step-1)//step)
+    return batch
 
 def scan_cycle():
     global reject_count
     reject_count = {}
-    try:
-        syms = top_symbols(SCAN_TOP)
-    except Exception as e:
-        logging.error(f"load symbols: {e}"); syms = FALLBACK_UNIVERSE[:SCAN_TOP]
 
-    # Scout Mode؟ إذا كثرت no_recent_cross أو extended_from_ema20 في الدورة السابقة
-    scout = False
-    if sum(reject_count.get(x, 0) for x in ("no_recent_cross","extended_from_ema20")) > 0:
-        scout = True  # عند أول دورة ما يفيد؛ يتحفّز في الدورات التالية
+    try:
+        all_syms = top_symbols(SCAN_TOP)
+    except Exception as e:
+        logging.error(f"load symbols: {e}"); all_syms = FALLBACK_UNIVERSE[:SCAN_TOP]
+
+    batch = _current_batch_symbols(all_syms)
+    # Scout Mode: فعّله إذا كان سبب الرفض السابق أحد هذين بكثرة
+    scout = (reject_count.get("no_recent_cross",0) + reject_count.get("extended_from_ema20",0)) > 10
+
     picks = []
-    for sym in syms:
+    for sym in batch:
         try:
             if cooldown.get(sym, 0) > time.time():
                 reject_count["cooldown"] = reject_count.get("cooldown",0)+1
@@ -435,7 +450,7 @@ def scan_cycle():
                 "state": "OPEN", "tp_stage": 0,
                 "last_bar_time": int(df["ts"].iloc[-1].timestamp())
             })
-            if len(picks) >= MAX_SIGNALS_CYCLE:
+            if len(picks) >= 3:  # أقصى إرسال بالدورة
                 break
         except Exception as e:
             logging.error(f"scan {sym}: {e}")
@@ -457,11 +472,11 @@ def send_signal(sig):
 def send_diag_if_due():
     global _last_diag
     now = time.time()
-    if now - _last_diag < DIAG_EVERY_MIN*60:
-        return
+    if now - _last_diag < DIAG_EVERY_MIN*60: return
     reasons_sorted = sorted(reject_count.items(), key=lambda x: x[1], reverse=True)
     lines = [f"📋 <b>لماذا لا توجد توصيات (الدورة)</b>",
-             f"عتبات: ATRx≤{EXTENSION_MAX_ATR} • ADX≥{ADX_MIN} • RR≥{MIN_RR} • vol≥{VOL_SPIKE_MIN}×"]
+             f"عتبات: ATRx≤{EXTENSION_MAX_ATR} • ADX≥{ADX_MIN} • RR≥{MIN_RR} • vol≥{VOL_SPIKE_MIN}×",
+             f"دفعة المسح: {SCAN_BATCH}/{SCAN_TOP}"]
     if reasons_sorted:
         lines.append("أكثر أسباب الرفض:")
         for k,v in reasons_sorted[:6]:
@@ -477,8 +492,7 @@ def res_exit(sym, st, result, price, exit_reason):
     xl_append_signal(st, result, exit_t, dur, pl_pct, exit_reason)
     emoji = {"SL":"🛑","TP1":"✅","TP2":"🎉","TP3":"🏆"}.get(result, "✅")
     tg(f"{emoji} <b>{result}</b> {sym.replace('/USDT:USDT','/USDT')} @ <code>{price}</code>\n"
-       f"P/L: <b>{pl_pct:+.2f}%</b> • مدة: {dur:.0f}m\n"
-       f"{exit_reason}")
+       f"P/L: <b>{pl_pct:+.2f}%</b> • مدة: {dur:.0f}m\n{exit_reason}")
     st["state"] = "CLOSED"
 
 def maybe_update_trailing(st):
@@ -526,17 +540,25 @@ def heartbeat_if_due():
     now = time.time()
     if now - _last_hb < HEARTBEAT_EVERY_MIN*60: return
     open_cnt = sum(1 for s in open_trades.values() if s.get("state")=="OPEN")
-    tg(f"💓 <b>Heartbeat</b>\n⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP}\nصفقات مفتوحة: {open_cnt}\nDiag كل {DIAG_EVERY_MIN}m • HB كل {HEARTBEAT_EVERY_MIN}m")
+    tg(f"💓 <b>Heartbeat</b>\n⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP} • Batch: {SCAN_BATCH}\nصفقات مفتوحة: {open_cnt}\nDiag كل {DIAG_EVERY_MIN}m • HB كل {HEARTBEAT_EVERY_MIN}m")
     _last_hb = now
+
+# ========= بوت =========
+_running = True
+def handle_sig(signum, frame):
+    global _running
+    _running = False
+signal.signal(signal.SIGINT, handle_sig)
+signal.signal(signal.SIGTERM, handle_sig)
 
 def bot_loop():
     logging.info("🚀 v7_plus bot running")
     tg("🤖 <b>Bot Started • v7_plus</b>\n"
-       f"⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP}\n"
+       f"⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP} • Batch: {SCAN_BATCH}\n"
        f"🛑 SL: max({SL_ATR_BASE}×ATR, خلف EMA50 {SL_BEHIND_EMA50_ATR}×ATR)\n"
        f"📈 شروط: EMA20/50 + Vol≥{VOL_SPIKE_MIN}× + ADX≥{ADX_MIN} • RR≥{MIN_RR}")
 
-    while True:
+    while _running:
         try:
             picks = scan_cycle()
             if picks and not entry_window_ok():
@@ -544,11 +566,13 @@ def bot_loop():
                 picks = []
             for s in picks:
                 send_signal(s); time.sleep(2)
-            # تتبّع بمهلة قصيرة لتخفيف الطلبات
+
             loops = max(1, SLEEP_BETWEEN // 5)
             for _ in range(loops):
+                if not _running: break
                 track_cycle()
                 time.sleep(5)
+
             send_diag_if_due()
             heartbeat_if_due()
         except Exception as e:
@@ -556,7 +580,7 @@ def bot_loop():
             tg(f"⚠️ Runtime error: <code>{str(e)[:180]}</code>")
             time.sleep(3)
 
-# ========= Web Service (Render) =========
+# ========= Web + KeepAlive =========
 app = FastAPI()
 
 @app.get("/")
@@ -564,10 +588,21 @@ app = FastAPI()
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
+def self_keepalive():
+    # يطلب /healthz كل 4 دقائق حتى لا تنام النسخة المجانية قدر الإمكان
+    if KEEPALIVE != "on": return
+    url = os.getenv("KEEPALIVE_URL") or f"http://127.0.0.1:{int(os.getenv('PORT','10000'))}/healthz"
+    while _running:
+        try:
+            requests.get(url, timeout=5)
+        except Exception:
+            pass
+        time.sleep(240)
+
 def run():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
+    threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=self_keepalive, daemon=True).start()
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
