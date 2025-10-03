@@ -1,260 +1,329 @@
-# trading_bot.py
-# =========================
-# تشغيل محلّي:
-#   uvicorn trading_bot:app --host 0.0.0.0 --port 8000 --workers 1
-#
-# على Render:
-#   اضبط Command إلى:
-#   uvicorn trading_bot:app --host 0.0.0.0 --port $PORT --workers 1
-#
-# متطلبات:
-#   pip install fastapi uvicorn ccxt pandas numpy
-#
-# ملاحظات:
-# - يعالج خطأ pandas "not in index" عبر عدم استخدام قائمة العوائد للفهرسة مطلقًا.
-# - يحسب العوائد، ينظّف NaN/Inf، ويحوّلها إلى numpy vector للاستدلال/القياس.
-# - يوفّر مسار /health ومسار /scan مع بارامترات للتحكم.
-
+# trading_bot_0_3.py
 import os
-import time
+import asyncio
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-import ccxt
+import ccxt.async_support as ccxt_async  # النسخة غير المتزامنة
+# ملاحظة: نحن لا نستخدم ccxt.pro (ويب سوكِت)، فقط HTTP مع تمكين تحديد المعدل
 
-# إعداد اللوجينغ
+
+# =========================
+# إعدادات عامة وتهيئة لوجز
+# =========================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("trading_bot")
 
-# إعدادات افتراضية عبر المتغيرات البيئية
-DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "bybit")  # مثال: bybit | binanceusdm | okx | gateio
-DEFAULT_TIMEFRAME = os.getenv("TIMEFRAME", "1m")
-DEFAULT_OHLCV_LIMIT = int(os.getenv("OHLCV_LIMIT", "500"))
-DEFAULT_VECTOR_LENGTH = int(os.getenv("VECTOR_LENGTH", "120"))
-DEFAULT_MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "60"))
+DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "binance")
+DEFAULT_QUOTE = os.getenv("QUOTE", "USDT")
+DEFAULT_TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+DEFAULT_SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "120"))  # حد أقصى للنتائج الراجعة
+DEFAULT_MIN_QUOTE_VOL = float(os.getenv("MIN_QUOTE_VOL", "100000"))  # بالـ USDT
+REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "20000"))  # 20 ثانية
+
+# =========================
+# FastAPI App
+# =========================
+app = FastAPI(title="trading_bot", version="0.3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# ---------- أدوات مساعدة ----------
+# =========================
+# أدوات مساعدة
+# =========================
+def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    try:
+        if b == 0:
+            return None
+        return a / b
+    except Exception:
+        return None
 
-def make_exchange(name: str):
+
+def compute_indicators_from_ohlcv(ohlcv: List[List[float]]) -> Dict[str, Any]:
     """
-    يبني كائن ccxt Exchange مع معدل طلبات مفعّل.
-    لتبديل البورصة استعمل متغير البيئة EXCHANGE.
+    ohlcv = [[timestamp, open, high, low, close, volume], ...]
+    يعيد آخر قيمة لمؤشرات شائعة: EMA20/50/200 و RSI14 بالإضافة إلى الإغلاق الأخير.
     """
-    name = (name or DEFAULT_EXCHANGE).lower()
-    if not hasattr(ccxt, name):
-        raise ValueError(f"Exchange '{name}' غير مدعوم في ccxt")
-    klass = getattr(ccxt, name)
-    exchange = klass({
-        "enableRateLimit": True,
-        "options": {},
-    })
+    if not ohlcv or len(ohlcv) < 50:  # نحتاج بيانات كافية على الأقل للمؤشرات
+        return {"close": None, "ema20": None, "ema50": None, "ema200": None, "rsi14": None}
 
-    # تلميحات لبعض البورصات للعقود الدائمة
-    # Bybit: type swap تلقائيًا
-    if name in ("binanceusdm", "binance"):
-        # binanceusdm = عقود USDT-M؛ binance (spot) لا يحتوي :USDT
-        exchange.options["defaultType"] = "swap"
-    if name == "okx":
-        exchange.options["defaultType"] = "swap"
-    if name == "gateio":
-        exchange.options["defaultType"] = "swap"
+    df = pd.DataFrame(
+        ohlcv,
+        columns=["ts", "open", "high", "low", "close", "volume"],
+    )
 
+    close = df["close"].astype(float)
+
+    # EMA
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean() if len(close) >= 200 else pd.Series([np.nan] * len(close))
+
+    # RSI 14
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    roll_up = gain.rolling(window=14, min_periods=14).mean()
+    roll_down = loss.rolling(window=14, min_periods=14).mean()
+    rs = roll_up / roll_down
+    rsi14 = 100.0 - (100.0 / (1.0 + rs))
+
+    return {
+        "close": float(close.iloc[-1]) if pd.notna(close.iloc[-1]) else None,
+        "ema20": float(ema20.iloc[-1]) if pd.notna(ema20.iloc[-1]) else None,
+        "ema50": float(ema50.iloc[-1]) if pd.notna(ema50.iloc[-1]) else None,
+        "ema200": float(ema200.iloc[-1]) if pd.notna(ema200.iloc[-1]) else None,
+        "rsi14": float(rsi14.iloc[-1]) if pd.notna(rsi14.iloc[-1]) else None,
+    }
+
+
+async def make_exchange(exchange_id: str):
+    """
+    إنشاء كائن البورصة من ccxt (نسخة async)، تمكين تحديد المعدل، وضبط المهلة.
+    """
+    if not hasattr(ccxt_async, exchange_id):
+        raise HTTPException(status_code=400, detail=f"Exchange '{exchange_id}' is not supported by ccxt.")
+
+    exchange_class = getattr(ccxt_async, exchange_id)
+    exchange = exchange_class(
+        {
+            "enableRateLimit": True,
+            "timeout": REQUEST_TIMEOUT_MS,
+            "options": {
+                "defaultType": "spot",  # نعتمد السوق الفوري
+            },
+        }
+    )
     return exchange
 
 
-def list_linear_usdt_symbols(exchange) -> List[str]:
+def is_spot_usdt_symbol(symbol: str, quote: str = "USDT") -> bool:
     """
-    يُرجع قائمة بالرموز من نوع عقود دائمة خطية (USDT-settled)،
-    بصيغة ccxt مثل: BTC/USDT:USDT.
+    نستبعد رموز العقود الدائمة مثل 'BTC/USDT:USDT' (وجود نقطتين ':')
+    ونحصرها في أزواج سبوت وتنتهي بـ '/USDT'
     """
-    markets = exchange.load_markets()
-    syms: List[str] = []
-    for m in markets.values():
+    if ":" in symbol:
+        return False
+    return symbol.upper().endswith(f"/{quote.upper()}")
+
+
+def ticker_24h_change(t: Dict[str, Any]) -> Optional[float]:
+    """
+    يحسب نسبة التغير 24 ساعة إن أمكن، يعتمد على (last, open) أو نسبة 'percentage' إن وجدت.
+    """
+    last = t.get("last")
+    open_ = t.get("open")
+    pct = t.get("percentage")
+
+    if pct is not None:
         try:
-            if not m.get("active", True):
-                continue
-            if not m.get("swap", False):
-                continue
-            if m.get("quote") != "USDT":
-                continue
-            # نفضّل التسوية بالـ USDT (Linear)
-            if m.get("settle") and m.get("settle") != "USDT":
-                continue
-            symbol = m.get("symbol")
-            if not symbol:
-                continue
-            # صيغة ccxt للعقود الخطية غالباً تحوي ':USDT'
-            # لكن ليس شرطاً في كل البورصات—لذا لا نفرضه.
-            syms.append(symbol)
+            return float(pct)
         except Exception:
-            # تجاهل أي سوق غريب
-            continue
+            pass
 
-    # فرز لتناسق النتائج
-    syms = sorted(set(syms))
-    return syms
+    val = safe_div((last - open_) if (last is not None and open_ is not None) else None, open_)
+    return float(val * 100) if val is not None else None
 
 
-def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+def ticker_quote_volume(t: Dict[str, Any]) -> Optional[float]:
     """
-    يسحب OHLCV ويُرجعه DataFrame مرتب تصاعدياً بالوقت.
+    يقدّر حجم التداول بالعملة المقابلة (Quote Volume).
+    يفضّل 'quoteVolume'، وإلا يحاول baseVolume * last.
     """
-    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not raw or len(raw[0]) < 6:
-        raise ValueError(f"لا توجد بيانات OHLCV كافية للرمز {symbol}")
-    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    # تأكد أن الأسعار float
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def vectorize_returns(df: pd.DataFrame, n: int) -> Optional[np.ndarray]:
-    """
-    يُحوّل سلسلة أسعار الإغلاق إلى متجه عوائد بطول n.
-    لا يقوم بأي فهرسة DataFrame باستخدام هذه القائمة — فقط يُرجع numpy array.
-    """
-    close = df["close"].astype(float)
-    # احسب العوائد كنسبة مئوية بين الشموع
-    ret = close.pct_change()
-    # نظّف القيم غير الصالحة
-    ret = ret.replace([np.inf, -np.inf], np.nan).dropna()
-
-    if len(ret) < n:
-        return None
-
-    # لا تفهرس df بهذه القائمة! فقط أعدها كمصفوفة لاستخدامها في الحسابات
-    vec = ret.iloc[-n:].to_numpy(dtype=float)
-    return vec
-
-
-def simple_score(vec: np.ndarray) -> float:
-    """
-    درجة مبسطة لقياس الزخم/التذبذب — للتوضيح فقط.
-    (يمكن استبدالها بنموذجك الحقيقي).
-    """
-    if vec.size == 0:
-        return float("nan")
-    last = vec[-1]
-    vol = np.std(vec) or 1e-9
-    # Momentum-to-Volatility
-    score = float(last / vol)
-    return score
-
-
-def scan_symbols(
-    exchange,
-    symbols: List[str],
-    timeframe: str,
-    limit: int,
-    n: int,
-    max_symbols: int,
-) -> List[Dict[str, Any]]:
-    """
-    يمسح مجموعة رموز، يُرجع قائمة نتائج تحتوي الدرجة وآخر عائد، إلخ.
-    """
-    results: List[Dict[str, Any]] = []
-    count = 0
-    for symbol in symbols:
-        if count >= max_symbols:
-            break
+    qv = t.get("quoteVolume")
+    if qv is not None:
         try:
-            df = fetch_ohlcv_df(exchange, symbol, timeframe=timeframe, limit=limit)
-            vec = vectorize_returns(df, n=n)
-            if vec is None:
-                logger.info(f"تجاوز {symbol}: بيانات العوائد غير كافية (n={n})")
-                continue
-
-            score = simple_score(vec)
-            res = {
-                "symbol": symbol,
-                "score": round(score, 6),
-                "last_return": round(float(vec[-1]), 8),
-                "vector_len": int(len(vec)),
-                "last_ts": df["timestamp"].iloc[-1].isoformat(),
-            }
-            results.append(res)
-            count += 1
-
-        except ccxt.NetworkError as e:
-            logger.warning(f"مشكلة شبكة للرمز {symbol}: {e}")
-        except ccxt.RateLimitExceeded as e:
-            logger.warning(f"تخطّي حد المعدّل، سننام قليلًا... {e}")
-            time.sleep(1.0)
+            return float(qv)
         except Exception:
-            # هذه السطور تستبدل رسائل "not in index" بمكدس مفيد يذكر السطر المسبب
-            logger.exception(f"scan error {symbol}")
+            pass
 
-    return results
+    base_vol = t.get("baseVolume")
+    last = t.get("last")
+    if base_vol is not None and last is not None:
+        try:
+            return float(base_vol) * float(last)
+        except Exception:
+            return None
+    return None
 
 
-# ---------- تطبيق FastAPI ----------
-
-app = FastAPI(title="trading_bot", version="0.4.0")
-
-
+# =========================
+# REST Endpoints
+# =========================
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+async def root():
+    return {
+        "name": "trading_bot",
+        "version": "0.3.0",
+        "endpoints": {
+            "health": "/health",
+            "scan": "/scan?quote=USDT&limit=60&min_vol=100000",
+            "indicators": "/indicators?symbol=BTC/USDT&timeframe=1h&limit=300",
+        },
+        "defaults": {
+            "exchange": DEFAULT_EXCHANGE,
+            "quote": DEFAULT_QUOTE,
+            "timeframe": DEFAULT_TIMEFRAME,
+            "scan_limit": DEFAULT_SCAN_LIMIT,
+            "min_quote_volume": DEFAULT_MIN_QUOTE_VOL,
+        },
+        "note": "هذا السيرفر لا يفتح صفقات حقيقية. فقط مسح وإرجاع بيانات/إشارات مبسّطة.",
+    }
+
+
 @app.get("/scan")
-def scan(
-    exchange_name: str = Query(DEFAULT_EXCHANGE, description="اسم البورصة في ccxt، مثل bybit أو binanceusdm"),
-    timeframe: str = Query(DEFAULT_TIMEFRAME, description="الإطار الزمني لـ OHLCV، مثل 1m/5m/15m/1h"),
-    limit: int = Query(DEFAULT_OHLCV_LIMIT, ge=100, le=1500, description="عدد شموع OHLCV المطلوب سحبها"),
-    n: int = Query(DEFAULT_VECTOR_LENGTH, ge=10, le=1000, description="طول متجه العوائد"),
-    max_symbols: int = Query(DEFAULT_MAX_SYMBOLS, ge=1, le=500, description="أقصى عدد رموز في المسح"),
-):
+async def scan_market(
+    quote: str = Query(DEFAULT_QUOTE, description="العملة المقابلة، مثال: USDT"),
+    limit: int = Query(DEFAULT_SCAN_LIMIT, ge=1, le=500, description="عدد النتائج كحد أقصى"),
+    min_vol: float = Query(DEFAULT_MIN_QUOTE_VOL, ge=0.0, description="أقل حجم تداول بالـ Quote ليتم تضمين الزوج"),
+    exchange_id: str = Query(DEFAULT_EXCHANGE, description="معرّف البورصة في ccxt (مثل binance)"),
+) -> Dict[str, Any]:
     """
-    يشغّل مسحًا سريعًا ويُرجع النتائج JSON.
-    مثال:
-      GET /scan?exchange_name=bybit&timeframe=1m&limit=500&n=120&max_symbols=50
+    يمسح سوق البورصة المحددة، يُرجع أفضل الرابحين والخاسرين حسب نسبة التغير 24 ساعة مع فلترة حسب حجم التداول.
     """
+    exchange = await make_exchange(exchange_id)
     try:
-        ex = make_exchange(exchange_name)
-        symbols = list_linear_usdt_symbols(ex)
-        if not symbols:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"لا توجد رموز swap USDT في '{exchange_name}'"},
+        await exchange.load_markets()
+        # نجلب كل التيكرز دفعة واحدة (أسرع على Binance)
+        tickers = await exchange.fetch_tickers()
+
+        rows = []
+        for sym, t in tickers.items():
+            if not is_spot_usdt_symbol(sym, quote):
+                continue
+            pct = ticker_24h_change(t)
+            qv = ticker_quote_volume(t)
+            last = t.get("last")
+            if qv is None or last is None:
+                continue
+            if qv < min_vol:
+                continue
+            rows.append(
+                {
+                    "symbol": sym,
+                    "last": float(last),
+                    "pct24h": pct if pct is not None else None,
+                    "quoteVolume": float(qv),
+                }
             )
-        results = scan_symbols(
-            ex,
-            symbols=symbols,
-            timeframe=timeframe,
-            limit=limit,
-            n=n,
-            max_symbols=max_symbols,
+
+        # تحويل لقائمة مرتبة
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"exchange": exchange_id, "quote": quote, "count": 0, "gainers": [], "losers": []}
+
+        # قد تكون pct24h فيها None؛ نستبدل بـ -inf للترتيب ثم نعيدها None في الإخراج لو أردت
+        df["pct24h_f"] = df["pct24h"].astype(float)
+        df["pct24h_f"] = df["pct24h_f"].fillna(-np.inf)
+
+        top_gainers = (
+            df.sort_values(["pct24h_f", "quoteVolume"], ascending=[False, False])
+            .head(limit)
+            .drop(columns=["pct24h_f"])
+            .to_dict(orient="records")
         )
-        payload = {
-            "exchange": exchange_name,
+        top_losers = (
+            df.sort_values(["pct24h_f", "quoteVolume"], ascending=[True, False])
+            .head(limit)
+            .drop(columns=["pct24h_f"])
+            .to_dict(orient="records")
+        )
+
+        return {
+            "exchange": exchange_id,
+            "quote": quote,
+            "count": int(df.shape[0]),
+            "gainers": top_gainers,
+            "losers": top_losers,
+        }
+    except Exception as e:
+        logger.exception("scan error: %s", e)
+        raise HTTPException(status_code=503, detail=f"scan failed: {e}")
+    finally:
+        try:
+            await exchange.close()
+        except Exception:
+            pass
+
+
+@app.get("/indicators")
+async def indicators(
+    symbol: str = Query(..., description="مثال: BTC/USDT"),
+    timeframe: str = Query(DEFAULT_TIMEFRAME, description="الإطار الزمني مثل: 1h, 4h, 15m, 1d"),
+    limit: int = Query(300, ge=50, le=1500, description="عدد الشموع المطلوب"),
+    exchange_id: str = Query(DEFAULT_EXCHANGE, description="معرّف البورصة في ccxt (مثل binance)"),
+) -> Dict[str, Any]:
+    """
+    يجلب OHLCV ويحسب مؤشرات أساسية: EMA20/50/200 و RSI14.
+    """
+    if ":" in symbol:
+        # لتجنُّب مشاكل العقود الدائمة ذات الصيغة BTC/USDT:USDT
+        raise HTTPException(status_code=400, detail="هذا المسار يدعم أزواج السبوت فقط (بدون نقطتين في الرمز).")
+
+    exchange = await make_exchange(exchange_id)
+
+    try:
+        await exchange.load_markets()
+        markets = exchange.markets or {}
+        if symbol not in markets:
+            raise HTTPException(status_code=404, detail=f"symbol '{symbol}' not found on {exchange_id}")
+
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv:
+            raise HTTPException(status_code=404, detail="no OHLCV returned")
+
+        indic = compute_indicators_from_ohlcv(ohlcv)
+        return {
+            "exchange": exchange_id,
+            "symbol": symbol,
             "timeframe": timeframe,
             "limit": limit,
-            "vector_n": n,
-            "scanned": len(results),
-            "results": results,
+            "last": indic["close"],
+            "ema20": indic["ema20"],
+            "ema50": indic["ema50"],
+            "ema200": indic["ema200"],
+            "rsi14": indic["rsi14"],
         }
-        return payload
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("فشل مسار /scan")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.exception("indicators error: %s", e)
+        raise HTTPException(status_code=503, detail=f"indicators failed: {e}")
+    finally:
+        try:
+            await exchange.close()
+        except Exception:
+            pass
 
 
-# تشغيل محلي/على Render
+# =========================
+# تشغيل Uvicorn محليًا أو على Render
+# =========================
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("trading_bot:app", host="0.0.0.0", port=port, reload=False, workers=1)
+    # ملاحظة مهمة: نشغّل الكائن app مباشرة (بدون سلسلة 'module:app') لتفادي خطأ الاستيراد.
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
