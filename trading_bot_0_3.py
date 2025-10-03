@@ -1,286 +1,204 @@
-# trading_bot_0_3.py  -- إصدار مع تشخيص الأسباب
-# استراتيجية: تقاطع EMA20/EMA50 + فلتر RSI + ملخص "لا إشارات"
-# يعمل FastAPI ويُرسل إشعارات تيليجرام
-
-import os
-import time
-import math
-import asyncio
-import logging
-from typing import Dict, List, Optional, Tuple
-
-import ccxt
-import pandas as pd
-import requests
+# trading_bot_0_3.py
+import os, time, math, asyncio, traceback
+from typing import List, Optional, Tuple, Dict
+import aiohttp, ccxt
 from fastapi import FastAPI
+import uvicorn
 
-# ============== عَدِّل هُنا ==================
-BOT_TOKEN: str = "123456:ABCDEF_PUT_YOUR_TOKEN"   # توكن تيليجرام
-CHAT_ID: str   = "-1001234567890"                 # آي-دي قناة/مجموعة/شخص
+app = FastAPI(title="trading_bot")
 
-SYMBOLS: List[str] = [
-    "BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT","DOGE/USDT"
-]
-TIMEFRAME: str = "5m"
-SCAN_EVERY_SEC: int = 60
-EMA_FAST: int = 20
-EMA_SLOW: int = 50
-RSI_LEN: int = 14
-RSI_BUY_MIN: float = 50.0      # فلتر شراء
-RSI_SELL_MAX: float = 50.0      # فلتر بيع
+# ========= الإعدادات =========
+# طلبت هاردكود: (تحذير: غير آمن لو الكود عام)
+HARDCODE_BOT_TOKEN = "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs"
+HARDCODE_CHAT_ID   = "8429537293"
+HARDCODE_TOPIC_ID  = ""       # اختياري (message_thread_id)
+HARDCODE_ROOT_REPLY_MESSAGE_ID = ""  # اختياري: نخلي كل الرسائل Reply على رسالة ثابتة
 
-# كم مرّة نرسل ملخص "لا إشارات"
-NO_SIGNAL_SUMMARY_EVERY_SEC: int = 600
-# ============================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", HARDCODE_BOT_TOKEN).strip()
+CHAT_ID   = os.getenv("CHAT_ID", HARDCODE_CHAT_ID).strip()
+TOPIC_ID  = os.getenv("TOPIC_ID", HARDCODE_TOPIC_ID).strip()
+ROOT_REPLY_MESSAGE_ID = os.getenv("ROOT_REPLY_MESSAGE_ID", HARDCODE_ROOT_REPLY_MESSAGE_ID).strip()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-app = FastAPI(title="trading_bot", version="0.3")
+EXCHANGE_ID = os.getenv("EXCHANGE", "binance").strip()
+TIMEFRAME   = os.getenv("TIMEFRAME", "5m").strip()
+SYMBOLS     = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
+LOOKBACK    = int(os.getenv("LOOKBACK", "200"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.002"))  # 0.2%
+TP_PCT      = float(os.getenv("TP_PCT", "0.01"))        # 1%
+SL_PCT      = float(os.getenv("SL_PCT", "0.005"))       # 0.5%
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
+NO_SIGNAL_EVERY_MIN = int(os.getenv("NO_SIGNAL_EVERY_MIN", "10"))
 
-exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-
-# ذاكرة لمنع التكرار والمتابعة
-last_side: Dict[str, Optional[str]] = {}
-last_price: Dict[str, float] = {}
-last_rsi: Dict[str, float] = {}
-last_time: Dict[str, int] = {}
-last_summary_ts: float = 0.0
-no_signal_streak: int = 0
-
-# ---------- أدوات ----------
-def tg_send(text: str) -> bool:
-    """إرسال تيليجرام مع لوج خطأ واضح إذا المعرّفات ناقصة."""
-    if "PUT_YOUR_TOKEN" in BOT_TOKEN or not BOT_TOKEN or not CHAT_ID:
-        logging.error("❌ BOT_TOKEN/CHAT_ID مفقود. عدّل القيم داخل الملف.")
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True},
-            timeout=12,
-        )
-        ok = r.status_code == 200 and r.json().get("ok", False)
-        if not ok:
-            logging.error(f"Telegram error {r.status_code}: {r.text}")
-        return ok
-    except Exception as e:
-        logging.exception(f"Telegram exception: {e}")
-        return False
-
-def safe_df(ohlcv: List[List[float]]) -> Optional[pd.DataFrame]:
-    if not ohlcv or len(ohlcv) < max(EMA_SLOW, RSI_LEN) + 2:
-        return None
-    df = pd.DataFrame(ohlcv, columns=["t","o","h","l","c","v"]).dropna().reset_index(drop=True)
-    return df if len(df) >= max(EMA_SLOW, RSI_LEN) + 2 else None
-
-def calc_rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0).ewm(alpha=1/length, adjust=False).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1/length, adjust=False).mean().replace(0, 1e-12)
-    rs = up / dn
-    return 100 - (100 / (1 + rs))
-
-def analyze(df: pd.DataFrame) -> Dict:
-    c = df["c"].astype(float)
-    ema_fast = c.ewm(span=EMA_FAST, adjust=False).mean()
-    ema_slow = c.ewm(span=EMA_SLOW, adjust=False).mean()
-    rsi = calc_rsi(c, RSI_LEN)
-
-    prev_up = ema_fast.iloc[-2] <= ema_slow.iloc[-2]
-    now_up  = ema_fast.iloc[-1] >  ema_slow.iloc[-1]
-    prev_dn = ema_fast.iloc[-2] >= ema_slow.iloc[-2]
-    now_dn  = ema_fast.iloc[-1] <  ema_slow.iloc[-1]
-
-    cross_up = prev_up and now_up
-    cross_dn = prev_dn and now_dn
-
-    price = float(c.iloc[-1])
-    r = float(rsi.iloc[-1])
-    ef = float(ema_fast.iloc[-1])
-
-    rsi_ok_buy  = r >= RSI_BUY_MIN
-    rsi_ok_sell = r <= RSI_SELL_MAX
-    above_ef    = price > ef
-    below_ef    = price < ef
-
-    buy  = cross_up and rsi_ok_buy and above_ef
-    sell = cross_dn and rsi_ok_sell and below_ef
-
-    reasons: List[str] = []
-    cross_label = "up" if cross_up else ("down" if cross_dn else "none")
-
-    # تشخيص دقيق لعدم وجود إشارة
-    if not buy and not sell:
-        if not cross_up and not cross_dn:
-            reasons.append("no_cross")
-        if cross_up and not rsi_ok_buy:
-            reasons.append(f"RSI<{RSI_BUY_MIN}")
-        if cross_dn and not rsi_ok_sell:
-            reasons.append(f"RSI>{RSI_SELL_MAX}")
-        if cross_up and rsi_ok_buy and not above_ef:
-            reasons.append("price<=EMA_fast")
-        if cross_dn and rsi_ok_sell and not below_ef:
-            reasons.append("price>=EMA_fast")
-        if not reasons:
-            reasons.append("filters_blocked")
-
-    return {
-        "buy": buy, "sell": sell, "price": price, "rsi": r,
-        "ema_fast": ef, "ema_slow": float(ema_slow.iloc[-1]),
-        "cross": cross_label, "reasons": reasons,
-        "flags": {
-            "cross_up": cross_up, "cross_down": cross_dn,
-            "rsi_ok_buy": rsi_ok_buy, "rsi_ok_sell": rsi_ok_sell,
-            "above_ema_fast": above_ef, "below_ema_fast": below_ef,
-        }
-    }
-
-def fmt_price(p: float) -> str:
-    if p == 0 or math.isnan(p): return "0"
-    if p >= 1000: return f"{p:,.0f}"
-    if p >= 1:    return f"{p:,.2f}"
-    return f"{p:.6f}"
-
-async def fetch_ohlcv(sym: str) -> Optional[pd.DataFrame]:
-    try:
-        data = await asyncio.to_thread(exchange.fetch_ohlcv, sym, timeframe=TIMEFRAME, limit=200)
-        return safe_df(data)
-    except Exception as e:
-        logging.warning(f"fetch_ohlcv {sym} err: {e}")
-        return None
-
-def build_signal_msg(side: str, sym: str, d: Dict) -> str:
-    return (
-        f"📣 *{side}* {sym}\n"
-        f"سعر: `{fmt_price(d['price'])}`  ·  RSI({RSI_LEN}): `{round(d['rsi'],1)}`\n"
-        f"EMA{EMA_FAST}/{EMA_SLOW}  ·  TF: `{TIMEFRAME}`"
-    )
-
-def summarize_no_signals(results: Dict[str, Dict]) -> str:
-    # عدّاد لأسباب عدم الإشارة
-    counts: Dict[str, int] = {}
-    lines: List[str] = []
-    for sym, d in results.items():
-        if not d.get("ok"): 
-            counts["no_data"] = counts.get("no_data", 0) + 1
-            lines.append(f"- {sym}: no_data")
-            continue
-        if d["buy"] or d["sell"]:
-            continue
-        rs = d.get("reasons", []) or ["unknown"]
-        for r in rs:
-            counts[r] = counts.get(r, 0) + 1
-        rsi = round(d["rsi"],1) if "rsi" in d else "?"
-        ef = d.get("ema_fast")
-        hint = f"RSI={rsi}, price {('>' if d['flags'].get('above_ema_fast') else '<=')} EMA{EMA_FAST}" if ef is not None else f"RSI={rsi}"
-        lines.append(f"- {sym}: {', '.join(rs)} ({hint})")
-
-    # أعلى 3 أسباب
-    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_txt = ", ".join([f"{k}={v}" for k,v in top]) if top else "n/a"
-
-    # لا نزيد الطول كثير: نعرض أول 6 أسطر أمثلة
-    sample = "\n".join(lines[:6]) if lines else "- لا توجد أزواج مفحوصة"
-    return (
-        "ℹ️ *لا إشارات في هذه الدورة*\n"
-        f"الأسباب الشائعة: {top_txt}\n"
-        f"أمثلة:\n{sample}"
-    )
-
-# ---------- حلقة العمل ----------
-async def scan_once() -> Dict[str, dict]:
-    out: Dict[str, dict] = {}
-    for sym in SYMBOLS:
-        df = await fetch_ohlcv(sym)
-        if df is None:
-            out[sym] = {"ok": False, "reason": "no_data"}
-            continue
-        try:
-            d = analyze(df)
-            d["ok"] = True
-            out[sym] = d
-        except Exception as e:
-            logging.warning(f"analyze {sym} err: {e}")
-            out[sym] = {"ok": False, "reason": "analyze_err"}
+# ========= مؤشرات بسيطة =========
+def ema(series: List[float], period: int) -> List[float]:
+    k = 2.0 / (period + 1)
+    out, e = [], None
+    for v in series:
+        e = v if e is None else (v - e) * k + e
+        out.append(e)
     return out
 
-async def worker_loop():
-    global last_summary_ts, no_signal_streak
-    await asyncio.sleep(2)
+def rsi(series: List[float], period: int = 14) -> List[Optional[float]]:
+    rsis = [None]*len(series)
+    gains, losses = [], []
+    for i in range(1, len(series)):
+        ch = series[i] - series[i-1]
+        gains.append(max(ch, 0))
+        losses.append(max(-ch, 0))
+        if i >= period:
+            g = sum(gains[i-period:i]) / period
+            l = sum(losses[i-period:i]) / period
+            rsis[i] = 100.0 if l == 0 else 100 - 100/(1 + g/l)
+    return rsis
 
-    # رسالة تشغيل مفصّلة
-    started = (
-        f"✅ البوت اشتغل.\n"
-        f"TF: `{TIMEFRAME}` · EMA: `{EMA_FAST}/{EMA_SLOW}` · RSI_len: `{RSI_LEN}`\n"
-        f"فلتر شراء: RSI≥{RSI_BUY_MIN} · فلتر بيع: RSI≤{RSI_SELL_MAX}\n"
-        f"أزواج: {', '.join(SYMBOLS)}\n"
-        f"سأرسل ملخص *لا إشارات* كل ~{NO_SIGNAL_SUMMARY_EVERY_SEC//60} دقائق إذا لم تظهر إشارات."
-    )
-    tg_send(started)
+def atr(high: List[float], low: List[float], close: List[float], period: int = 14) -> List[Optional[float]]:
+    trs, out = [], []
+    for i in range(len(close)):
+        tr = (high[i]-low[i]) if i==0 else max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
+        trs.append(tr)
+        out.append(None if i < period else sum(trs[i-period+1:i+1]) / period)
+    return out
 
-    while True:
-        t0 = time.time()
-        res = await scan_once()
+# ========= Telegram =========
+async def tg_send(text: str, reply_to: Optional[int] = None) -> Optional[int]:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram OFF (BOT_TOKEN/CHAT_ID مفقود)")
+        return None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if TOPIC_ID:
+        payload["message_thread_id"] = int(TOPIC_ID)
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
+    async with aiohttp.ClientSession() as s:
+        async with s.post(url, json=payload, timeout=15) as r:
+            data = await r.json()
+            if not data.get("ok"):
+                print("Telegram error:", data)
+                return None
+            return data["result"]["message_id"]
 
-        any_signal = False
-        for sym, d in res.items():
-            if not d.get("ok"): 
-                logging.info(f"{sym}: {d.get('reason')}")
-                continue
+# ========= حالة الصفقات =========
+class Trade:
+    def __init__(self, symbol: str, entry: float, sl: float, tp: float, msg_id: Optional[int]):
+        self.symbol = symbol
+        self.entry, self.sl, self.tp = entry, sl, tp
+        self.msg_id = msg_id
+        self.active = True
 
-            last_price[sym] = float(d["price"])
-            last_rsi[sym]   = float(d["rsi"])
+trades: Dict[str, Trade] = {}
+last_no_signal_ts = 0.0
+last_no_signal_reason = ""
 
-            side = "BUY" if d["buy"] else ("SELL" if d["sell"] else None)
-            if side and last_side.get(sym) != side:
-                any_signal = True
-                last_side[sym] = side
-                last_time[sym] = int(time.time())
-                tg_send(build_signal_msg(side, sym, d))
+# ========= بيانات + إستراتيجية =========
+def fetch_candles(exchange, symbol: str, tf: str, limit: int):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    o = [x[1] for x in ohlcv]; h = [x[2]]*0 or [x[2] for x in ohlcv]  # أسرع من نسخ إضافي
+    l = [x[3] for x in ohlcv]; c = [x[4] for x in ohlcv]
+    return o, h, l, c
 
-        if any_signal:
-            no_signal_streak = 0
-        else:
-            no_signal_streak += 1
-            # ملخص “لا إشارات” بمعدل محدد
+def analyze_signal(opens, highs, lows, closes) -> Tuple[bool, str]:
+    if len(closes) < 50: return False, "بيانات غير كافية"
+    ema9, ema21 = ema(closes, 9), ema(closes, 21)
+    rs, _atr = rsi(closes, 14), atr(highs, lows, closes, 14)
+    c, a = closes[-1], _atr[-1]
+    if a is None or (a/max(c,1e-9)) < MIN_ATR_PCT: return False, f"ATR منخفض ({(a or 0)/max(c,1e-9):.4%} < {MIN_ATR_PCT:.2%})"
+    if not (ema9[-2] < ema21[-2] and ema9[-1] > ema21[-1]): return False, "لا يوجد تقاطع EMA9↑EMA21"
+    if rs[-1] is None or rs[-1] <= 50: return False, f"RSI <= 50 ({rs[-1]:.1f} إن وُجد)"
+    return True, ""
+
+async def scan_loop():
+    global last_no_signal_ts, last_no_signal_reason
+    ex = getattr(ccxt, EXCHANGE_ID)({'enableRateLimit': True})
+    root_reply = int(ROOT_REPLY_MESSAGE_ID) if ROOT_REPLY_MESSAGE_ID else None
+
+    try:
+        await tg_send(
+            f"✅ <b>البوت اشتغل</b>\n"
+            f"Exchange: <code>{EXCHANGE_ID}</code>\nTF: <code>{TIMEFRAME}</code>\n"
+            f"Pairs: <code>{', '.join(SYMBOLS)}</code>",
+            reply_to=root_reply
+        )
+
+        while True:
+            had_signal, reasons = False, []
+            for sym in SYMBOLS:
+                try:
+                    o,h,l,c = await asyncio.to_thread(fetch_candles, ex, sym, TIMEFRAME, LOOKBACK)
+                    signal, reason = analyze_signal(o,h,l,c)
+                    price = c[-1]
+
+                    # مراقبة صفقات قائمة
+                    tr = trades.get(sym)
+                    if tr and tr.active:
+                        if price >= tr.tp:
+                            tr.active = False
+                            await tg_send(
+                                f"🥳 <b>TP hit</b> {sym}\nEntry: {tr.entry:.6g}\nTP: {tr.tp:.6g}\n"
+                                f"الربح: {(tr.tp-tr.entry)/tr.entry:.2%}", reply_to=tr.msg_id
+                            )
+                        elif price <= tr.sl:
+                            tr.active = False
+                            await tg_send(
+                                f"🛑 <b>SL hit</b> {sym}\nEntry: {tr.entry:.6g}\nSL: {tr.sl:.6g}\n"
+                                f"الخسارة: {(tr.sl-tr.entry)/tr.entry:.2%}", reply_to=tr.msg_id
+                            )
+
+                    # فتح صفقة جديدة عند الإشارة
+                    if (not tr or not tr.active) and signal:
+                        entry = price
+                        sl = entry * (1 - SL_PCT)
+                        tp = entry * (1 + TP_PCT)
+                        msg_id = await tg_send(
+                            "📈 <b>إشارة شراء</b> {0}\nEntry: <code>{1:.6g}</code>\n"
+                            "SL: <code>{2:.6g}</code> ({3:.2%})\nTP: <code>{4:.6g}</code> ({5:.2%})\n"
+                            "فلتر: EMA9↑EMA21 + RSI>50 + ATR≥{6:.2%}".format(
+                                sym, entry, sl, -SL_PCT, tp, TP_PCT, MIN_ATR_PCT
+                            ),
+                            reply_to=root_reply
+                        )
+                        trades[sym] = Trade(sym, entry, sl, tp, msg_id)
+                        had_signal = True
+                    elif not signal:
+                        reasons.append(f"{sym}: {reason}")
+                except Exception as e:
+                    reasons.append(f"{sym}: خطأ {e}")
+
+            # لا إشارات؟ أرسل أسباب — كل X دقائق أو عند تغيّر السبب
             now = time.time()
-            if now - last_summary_ts >= NO_SIGNAL_SUMMARY_EVERY_SEC:
-                summary = summarize_no_signals(res)
-                tg_send(summary + f"\n(سلسلة بلا إشارات: {no_signal_streak} دورة)")
-                last_summary_ts = now
+            if not had_signal and reasons:
+                text = "\n".join(reasons[:8])
+                if (now - last_no_signal_ts) >= NO_SIGNAL_EVERY_MIN*60 and text != last_no_signal_reason:
+                    await tg_send("ℹ️ <b>لا توجد إشارات حالياً</b>\n" + text, reply_to=root_reply)
+                    last_no_signal_ts, last_no_signal_reason = now, text
 
-        # انتظار حتى يكمل المعدّل
-        elapsed = time.time() - t0
-        await asyncio.sleep(max(1, SCAN_EVERY_SEC - int(elapsed)))
+            await asyncio.sleep(SCAN_SECONDS)
+    except Exception:
+        err = traceback.format_exc()
+        print("FATAL LOOP ERROR:\n", err)
+        await tg_send("❌ خطأ في حلقة المسح:\n<code>"+(err[-3500:])+"</code>", reply_to=root_reply)
+    finally:
+        try: ex.close()
+        except Exception: pass
 
-# ---------- FastAPI ----------
+# ========= FastAPI =========
 @app.on_event("startup")
-async def on_startup():
-    asyncio.create_task(worker_loop())
+async def _startup():
+    print("Starting bot… Telegram:", "ON" if BOT_TOKEN and CHAT_ID else "OFF")
+    asyncio.create_task(scan_loop())
 
 @app.get("/")
-def root():
-    return {
-        "ok": True,
-        "service": "trading_bot",
-        "symbols": SYMBOLS,
-        "tf": TIMEFRAME,
-        "ema": [EMA_FAST, EMA_SLOW],
-        "rsi_len": RSI_LEN,
-        "filters": {"buy_min": RSI_BUY_MIN, "sell_max": RSI_SELL_MAX},
-    }
+def home():
+    return {"ok": True, "exchange": EXCHANGE_ID, "symbols": SYMBOLS, "tf": TIMEFRAME}
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health(): return {"status": "ok"}
 
-@app.get("/force")
-async def force_scan():
-    """مسح فوري مع إرجاع الأسباب/الأعلام لكل زوج (لا يرسل تيليجرام)."""
-    res_raw = await scan_once()
-    return {"ok": True, "results": res_raw}
+@app.post("/test")
+async def test():
+    mid = await tg_send("🔔 Test message from /test", reply_to=(int(ROOT_REPLY_MESSAGE_ID) if ROOT_REPLY_MESSAGE_ID else None))
+    return {"sent": bool(mid), "message_id": mid}
 
-# ---------- التشغيل ----------
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("trading_bot_0_3:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
