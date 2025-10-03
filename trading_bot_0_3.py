@@ -1,325 +1,260 @@
-# trading_bot_0_4.py
-import os, time, math, asyncio, random, logging
-from typing import List, Dict, Tuple, Optional
-import ccxt
-import pandas as pd
+# trading_bot.py
+# =========================
+# تشغيل محلّي:
+#   uvicorn trading_bot:app --host 0.0.0.0 --port 8000 --workers 1
+#
+# على Render:
+#   اضبط Command إلى:
+#   uvicorn trading_bot:app --host 0.0.0.0 --port $PORT --workers 1
+#
+# متطلبات:
+#   pip install fastapi uvicorn ccxt pandas numpy
+#
+# ملاحظات:
+# - يعالج خطأ pandas "not in index" عبر عدم استخدام قائمة العوائد للفهرسة مطلقًا.
+# - يحسب العوائد، ينظّف NaN/Inf، ويحوّلها إلى numpy vector للاستدلال/القياس.
+# - يوفّر مسار /health ومسار /scan مع بارامترات للتحكم.
+
+import os
+import time
+import logging
+from typing import List, Optional, Dict, Any
+
 import numpy as np
-from fastapi import FastAPI
-import uvicorn
-import httpx
+import pandas as pd
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 
-# -------------------- إعدادات عامة --------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+import ccxt
 
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-SCAN_TOP = int(os.getenv("SCAN_TOP", "120"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "35"))
-HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MIN", "30"))
-DIAG_MIN = int(os.getenv("DIAG_MIN", "10"))
+# إعداد اللوجينغ
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("trading_bot")
 
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+# إعدادات افتراضية عبر المتغيرات البيئية
+DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "bybit")  # مثال: bybit | binanceusdm | okx | gateio
+DEFAULT_TIMEFRAME = os.getenv("TIMEFRAME", "1m")
+DEFAULT_OHLCV_LIMIT = int(os.getenv("OHLCV_LIMIT", "500"))
+DEFAULT_VECTOR_LENGTH = int(os.getenv("VECTOR_LENGTH", "120"))
+DEFAULT_MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "60"))
 
-# شروط الاستراتيجية (v7_plus)
-VOL_MIN = float(os.getenv("VOL_MULT", "1.1"))      # vol ≥ 1.1x
-ADX_MIN = float(os.getenv("ADX_MIN", "18.0"))      # ADX ≥ 18
-RR_MIN  = float(os.getenv("RR_MIN",  "1.18"))      # RR ≥ 1.18
-ATR_EXT_MAX = float(os.getenv("ATR_EXT_MAX", "1.2"))  # امتداد من EMA20 ≤ 1.2×ATR
-CROSS_LOOKBACK = int(os.getenv("CROSS_LOOKBACK", "36"))  # خلال آخر 36 شمعة
 
-SL_ATR = 1.25
-SL_BEHIND_EMA50_ATR = 0.35
+# ---------- أدوات مساعدة ----------
 
-# -------------------- تليغرام --------------------
-async def tg_send(text: str):
-    if not TG_TOKEN or not TG_CHAT:
-        log.warning("TELEGRAM env vars missing -> skip send")
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            await client.post(url, json=payload)
-        except Exception as e:
-            log.error(f"telegram error: {e}")
-
-def human(x: float) -> str:
-    if abs(x) >= 1:
-        return f"{x:.2f}"
-    return f"{x:.4f}"
-
-# -------------------- مؤشرات --------------------
-def build_df(ohlcv: List[List[float]]) -> Optional[pd.DataFrame]:
-    if not ohlcv or len(ohlcv) < 100:
-        return None
-    cols = ["ts","open","high","low","close","volume"]
-    df = pd.DataFrame(ohlcv, columns=cols)
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df = df.set_index("ts")
-    return df
-
-def ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(span=n, adjust=False).mean()
-
-def atr_adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series]:
-    # True Range
-    close_prev = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - close_prev).abs(),
-        (df["low"] - close_prev).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-
-    # +DM / -DM
-    up = df["high"].diff()
-    dn = -df["low"].diff()
-    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
-    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
-    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-    return atr, adx
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    df["vol_med20"] = df["volume"].rolling(20).median()
-    df["vol_x"] = df["volume"] / df["vol_med20"]
-    atr, adx = atr_adx(df, 14)
-    df["atr"] = atr
-    df["adx"] = adx
-    # عوائد معلوماتية — لا تُستخدم للفهرسة
-    df["ret"] = df["close"].pct_change().fillna(0)
-    return df
-
-# -------------------- شروط الإستراتيجية --------------------
-def last_cross_bars(df: pd.DataFrame) -> Optional[int]:
-    ema20 = df["ema20"]
-    ema50 = df["ema50"]
-    cross_up = (ema20 > ema50) & (ema20.shift(1) <= ema50.shift(1))
-    cross_dn = (ema20 < ema50) & (ema20.shift(1) >= ema50.shift(1))
-    cross_idx = df.index[cross_up | cross_dn]
-    if len(cross_idx) == 0:
-        return None
-    bars = len(df) - (df.index.get_indexer([cross_idx[-1]])[0] + 1)
-    return bars
-
-def rr_estimate(side: str, close: float, ema50: float, atr: float) -> float:
-    sl_dist = max(SL_ATR*atr, max(close - ema50, 0) + SL_BEHIND_EMA50_ATR*atr) if side == "LONG" \
-              else max(SL_ATR*atr, max(ema50 - close, 0) + SL_BEHIND_EMA50_ATR*atr)
-    # هدف بسيط = 1.5 × ATR
-    tp_dist = 1.5 * atr
-    if sl_dist <= 0: 
-        return 0
-    return tp_dist / sl_dist
-
-def evaluate_symbol(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict[str, int]]:
+def make_exchange(name: str):
     """
-    يعيد توصية أو None + قاموس أسباب الرفض
+    يبني كائن ccxt Exchange مع معدل طلبات مفعّل.
+    لتبديل البورصة استعمل متغير البيئة EXCHANGE.
     """
-    reject: Dict[str,int] = {}
-    if df is None or len(df) < 100:
-        reject["no_data"] = 1
-        return None, reject
-
-    # نأخذ آخر 200 شمعة بطريقة سليمة (بدون loc بقيم)
-    df = df.iloc[-200:].copy()
-
-    df = compute_indicators(df)
-    df = df.dropna()
-    if df.empty:
-        reject["nan_all"] = 1
-        return None, reject
-
-    row = df.iloc[-1]
-    # حجم
-    if row["vol_x"] < VOL_MIN:
-        reject[f"low_dvol"] = 1
-        return None, reject
-    # ADX
-    if row["adx"] < ADX_MIN:
-        reject[f"adx_{int(row['adx'])}"] = 1
-        return None, reject
-
-    # امتداد عن EMA20
-    ext_atr = abs(row["close"] - row["ema20"]) / max(row["atr"], 1e-9)
-    if ext_atr > ATR_EXT_MAX:
-        reject["extended_from_ema20"] = 1
-        return None, reject
-
-    # تقاطع حديث
-    bars = last_cross_bars(df)
-    if bars is None or bars > CROSS_LOOKBACK:
-        reject["no_recent_cross"] = 1
-        return None, reject
-
-    # اتجاه
-    side = "LONG" if row["ema20"] >= row["ema50"] else "SHORT"
-    rr = rr_estimate(side, row["close"], row["ema50"], row["atr"])
-    if rr < RR_MIN:
-        reject["poor_rr"] = 1
-        return None, reject
-
-    sig = {
-        "side": side,
-        "close": float(row["close"]),
-        "ema20": float(row["ema20"]),
-        "ema50": float(row["ema50"]),
-        "atr": float(row["atr"]),
-        "adx": float(row["adx"]),
-        "volx": float(row["vol_x"]),
-        "rr": float(rr),
-        "bars_since_cross": bars,
-    }
-    return sig, reject
-
-# -------------------- OKX + جلب البيانات --------------------
-def okx() -> ccxt.okx:
-    return ccxt.okx({
+    name = (name or DEFAULT_EXCHANGE).lower()
+    if not hasattr(ccxt, name):
+        raise ValueError(f"Exchange '{name}' غير مدعوم في ccxt")
+    klass = getattr(ccxt, name)
+    exchange = klass({
         "enableRateLimit": True,
-        "rateLimit": 150,  # احترازي
-        "timeout": 20000,
-        "options": {"defaultType": "spot"},
+        "options": {},
     })
 
-def is_usdt_symbol(m: Dict) -> bool:
-    return (m.get("quote") == "USDT") and (m.get("active") is True)
+    # تلميحات لبعض البورصات للعقود الدائمة
+    # Bybit: type swap تلقائيًا
+    if name in ("binanceusdm", "binance"):
+        # binanceusdm = عقود USDT-M؛ binance (spot) لا يحتوي :USDT
+        exchange.options["defaultType"] = "swap"
+    if name == "okx":
+        exchange.options["defaultType"] = "swap"
+    if name == "gateio":
+        exchange.options["defaultType"] = "swap"
 
-def top_symbols_by_quotevol(exchange: ccxt.okx, top_n: int) -> List[str]:
+    return exchange
+
+
+def list_linear_usdt_symbols(exchange) -> List[str]:
+    """
+    يُرجع قائمة بالرموز من نوع عقود دائمة خطية (USDT-settled)،
+    بصيغة ccxt مثل: BTC/USDT:USDT.
+    """
     markets = exchange.load_markets()
-    syms = [s for s,m in markets.items() if is_usdt_symbol(m)]
-    tickers = exchange.fetch_tickers(syms)
-    scored = []
-    for s, t in tickers.items():
-        qv = t.get("quoteVolume") or 0
-        scored.append((s, qv))
-    scored.sort(key=lambda x: x[1] or 0, reverse=True)
-    return [s for s,_ in scored[:top_n]]
-
-def safe_fetch_ohlcv(exchange: ccxt.okx, symbol: str, timeframe: str, limit: int = 300) -> Optional[List[List[float]]]:
-    for attempt in range(6):
+    syms: List[str] = []
+    for m in markets.values():
         try:
-            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            msg = str(e)
-            # كود OKX rate limit
-            if "50011" in msg or "Too Many Requests" in msg:
-                sleep_s = 0.8 + random.random()*0.6
-                time.sleep(sleep_s)
+            if not m.get("active", True):
                 continue
-            # مؤقت أو الشبكة
-            time.sleep(0.4 + 0.2*attempt)
-    return None
+            if not m.get("swap", False):
+                continue
+            if m.get("quote") != "USDT":
+                continue
+            # نفضّل التسوية بالـ USDT (Linear)
+            if m.get("settle") and m.get("settle") != "USDT":
+                continue
+            symbol = m.get("symbol")
+            if not symbol:
+                continue
+            # صيغة ccxt للعقود الخطية غالباً تحوي ':USDT'
+            # لكن ليس شرطاً في كل البورصات—لذا لا نفرضه.
+            syms.append(symbol)
+        except Exception:
+            # تجاهل أي سوق غريب
+            continue
 
-# -------------------- ماسح التوصيات --------------------
-async def scan_once() -> Tuple[List[Tuple[str,Dict]], Dict[str,int]]:
-    ex = okx()
+    # فرز لتناسق النتائج
+    syms = sorted(set(syms))
+    return syms
+
+
+def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """
+    يسحب OHLCV ويُرجعه DataFrame مرتب تصاعدياً بالوقت.
+    """
+    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    if not raw or len(raw[0]) < 6:
+        raise ValueError(f"لا توجد بيانات OHLCV كافية للرمز {symbol}")
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    # تأكد أن الأسعار float
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def vectorize_returns(df: pd.DataFrame, n: int) -> Optional[np.ndarray]:
+    """
+    يُحوّل سلسلة أسعار الإغلاق إلى متجه عوائد بطول n.
+    لا يقوم بأي فهرسة DataFrame باستخدام هذه القائمة — فقط يُرجع numpy array.
+    """
+    close = df["close"].astype(float)
+    # احسب العوائد كنسبة مئوية بين الشموع
+    ret = close.pct_change()
+    # نظّف القيم غير الصالحة
+    ret = ret.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(ret) < n:
+        return None
+
+    # لا تفهرس df بهذه القائمة! فقط أعدها كمصفوفة لاستخدامها في الحسابات
+    vec = ret.iloc[-n:].to_numpy(dtype=float)
+    return vec
+
+
+def simple_score(vec: np.ndarray) -> float:
+    """
+    درجة مبسطة لقياس الزخم/التذبذب — للتوضيح فقط.
+    (يمكن استبدالها بنموذجك الحقيقي).
+    """
+    if vec.size == 0:
+        return float("nan")
+    last = vec[-1]
+    vol = np.std(vec) or 1e-9
+    # Momentum-to-Volatility
+    score = float(last / vol)
+    return score
+
+
+def scan_symbols(
+    exchange,
+    symbols: List[str],
+    timeframe: str,
+    limit: int,
+    n: int,
+    max_symbols: int,
+) -> List[Dict[str, Any]]:
+    """
+    يمسح مجموعة رموز، يُرجع قائمة نتائج تحتوي الدرجة وآخر عائد، إلخ.
+    """
+    results: List[Dict[str, Any]] = []
+    count = 0
+    for symbol in symbols:
+        if count >= max_symbols:
+            break
+        try:
+            df = fetch_ohlcv_df(exchange, symbol, timeframe=timeframe, limit=limit)
+            vec = vectorize_returns(df, n=n)
+            if vec is None:
+                logger.info(f"تجاوز {symbol}: بيانات العوائد غير كافية (n={n})")
+                continue
+
+            score = simple_score(vec)
+            res = {
+                "symbol": symbol,
+                "score": round(score, 6),
+                "last_return": round(float(vec[-1]), 8),
+                "vector_len": int(len(vec)),
+                "last_ts": df["timestamp"].iloc[-1].isoformat(),
+            }
+            results.append(res)
+            count += 1
+
+        except ccxt.NetworkError as e:
+            logger.warning(f"مشكلة شبكة للرمز {symbol}: {e}")
+        except ccxt.RateLimitExceeded as e:
+            logger.warning(f"تخطّي حد المعدّل، سننام قليلًا... {e}")
+            time.sleep(1.0)
+        except Exception:
+            # هذه السطور تستبدل رسائل "not in index" بمكدس مفيد يذكر السطر المسبب
+            logger.exception(f"scan error {symbol}")
+
+    return results
+
+
+# ---------- تطبيق FastAPI ----------
+
+app = FastAPI(title="trading_bot", version="0.4.0")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/scan")
+def scan(
+    exchange_name: str = Query(DEFAULT_EXCHANGE, description="اسم البورصة في ccxt، مثل bybit أو binanceusdm"),
+    timeframe: str = Query(DEFAULT_TIMEFRAME, description="الإطار الزمني لـ OHLCV، مثل 1m/5m/15m/1h"),
+    limit: int = Query(DEFAULT_OHLCV_LIMIT, ge=100, le=1500, description="عدد شموع OHLCV المطلوب سحبها"),
+    n: int = Query(DEFAULT_VECTOR_LENGTH, ge=10, le=1000, description="طول متجه العوائد"),
+    max_symbols: int = Query(DEFAULT_MAX_SYMBOLS, ge=1, le=500, description="أقصى عدد رموز في المسح"),
+):
+    """
+    يشغّل مسحًا سريعًا ويُرجع النتائج JSON.
+    مثال:
+      GET /scan?exchange_name=bybit&timeframe=1m&limit=500&n=120&max_symbols=50
+    """
     try:
-        symbols = top_symbols_by_quotevol(ex, SCAN_TOP)
+        ex = make_exchange(exchange_name)
+        symbols = list_linear_usdt_symbols(ex)
+        if not symbols:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"لا توجد رموز swap USDT في '{exchange_name}'"},
+            )
+        results = scan_symbols(
+            ex,
+            symbols=symbols,
+            timeframe=timeframe,
+            limit=limit,
+            n=n,
+            max_symbols=max_symbols,
+        )
+        payload = {
+            "exchange": exchange_name,
+            "timeframe": timeframe,
+            "limit": limit,
+            "vector_n": n,
+            "scanned": len(results),
+            "results": results,
+        }
+        return payload
     except Exception as e:
-        log.error(f"load markets/tickers error: {e}")
-        ex.close()
-        return [], {"load_err":1}
+        logger.exception("فشل مسار /scan")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    approved: List[Tuple[str,Dict]] = []
-    rejects: Dict[str,int] = {}
 
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i+BATCH_SIZE]
-        for s in batch:
-            try:
-                ohlcv = safe_fetch_ohlcv(ex, s, TIMEFRAME, 300)
-                if not ohlcv:
-                    rejects["no_data"] = rejects.get("no_data",0)+1
-                    continue
-                df = build_df(ohlcv)
-                sig, r = evaluate_symbol(df)
-                # اجمع أسباب الرفض
-                for k,v in r.items():
-                    rejects[k] = rejects.get(k,0)+v
-                if sig:
-                    approved.append((s, sig))
-            except Exception as e:
-                # أهم نقطة: لا نطبع قوائم floats؛ بس نوع الخطأ
-                log.error(f"scan error {s}: {type(e).__name__}: {e}")
-                rejects["scan_err"] = rejects.get("scan_err",0)+1
-
-        # تهدئة بسيطة بين الدُفعات
-        await asyncio.sleep(0.4)
-
-    ex.close()
-    return approved, rejects
-
-def fmt_start_msg() -> str:
-    return (
-        f"🤖 Bot Started • v7_plus\n"
-        f"⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP} • Batch: {BATCH_SIZE}\n"
-        f"🛑 SL: max({SL_ATR}×ATR, خلف EMA50 {SL_BEHIND_EMA50_ATR}×ATR)\n"
-        f"📈 شروط: EMA20/50 + Vol≥{VOL_MIN:.1f}× + ADX≥{ADX_MIN:.1f} • RR≥{RR_MIN:.2f}"
-    )
-
-def fmt_diag(rejects: Dict[str,int]) -> str:
-    parts = sorted(rejects.items(), key=lambda x: -x[1])
-    top = "\n".join([f"• {k}: {v}" for k,v in parts[:6]]) if parts else "• -"
-    return (
-        "📋 لماذا لا توجد توصيات (الدورة)\n"
-        f"عتبات: ATRx≤{ATR_EXT_MAX} • ADX≥{ADX_MIN:.1f} • RR≥{RR_MIN:.2f} • vol≥{VOL_MIN:.1f}×\n"
-        f"دفعة المسح: {BATCH_SIZE}/{SCAN_TOP}\n"
-        f"أكثر أسباب الرفض:\n{top}"
-    )
-
-def fmt_signal(sym: str, s: Dict) -> str:
-    return (
-        f"✅ {sym} • {s['side']}\n"
-        f"⏩ RR ~ {s['rr']:.2f} • ADX {s['adx']:.1f} • Vol× {s['volx']:.2f}\n"
-        f"EMA20 {human(s['ema20'])} • EMA50 {human(s['ema50'])}\n"
-        f"ATR {human(s['atr'])} • آخر تقاطع: {s['bars_since_cross']} شموع"
-    )
-
-def fmt_hb() -> str:
-    return f"💓 Heartbeat\n⏱️ TF: {TIMEFRAME} • 🔝 Top: {SCAN_TOP} • Batch: {BATCH_SIZE}\nصفقات مفتوحة: 0\nDiag كل {DIAG_MIN}m • HB كل {HEARTBEAT_MIN}m"
-
-# -------------------- المهام الدورية --------------------
-async def runner():
-    await tg_send("> توصيات تداول Ai:\n" + fmt_start_msg())
-    last_diag = 0.0
-    last_hb = 0.0
-    while True:
-        start = time.time()
-        approved, rejects = await scan_once()
-
-        if approved:
-            txt = "> توصيات تداول Ai:\n" + "\n\n".join([fmt_signal(sym, s) for sym,s in approved])
-            await tg_send(txt)
-        else:
-            now = time.time()
-            if now - last_diag > DIAG_MIN*60:
-                await tg_send("> توصيات تداول Ai:\n" + fmt_diag(rejects))
-                last_diag = now
-
-        # Heartbeat
-        if time.time() - last_hb > HEARTBEAT_MIN*60:
-            await tg_send("> توصيات تداول Ai:\n" + fmt_hb())
-            last_hb = time.time()
-
-        # دورة كل 60 ثانية (على فاصل 5m هذا خفيف)
-        took = time.time() - start
-        await asyncio.sleep(max(5.0, 60.0 - took))
-
-# -------------------- FastAPI --------------------
-app = FastAPI()
-
-@app.on_event("startup")
-async def _startup():
-    asyncio.create_task(runner())
-
-@app.get("/")
-def root():
-    return {"status":"ok","timeframe":TIMEFRAME,"top":SCAN_TOP,"batch":BATCH_SIZE}
-
+# تشغيل محلي/على Render
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","10000")))
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("trading_bot:app", host="0.0.0.0", port=port, reload=False, workers=1)
