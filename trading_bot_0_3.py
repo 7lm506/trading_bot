@@ -1,381 +1,364 @@
-# trading_bot_0_3.py
-import os, time, asyncio, json, html, logging
-from typing import Dict, Any, Optional, List, Tuple
+# trading_bot_0_4.py
+# يدعم: كل عملات الفيوتشرز تلقائيًا عبر SYMBOLS=AUTO_FUTURES
+# يصلّح Telegram HTML parse ويعمل reply للهدف/الستوب، ويذكر أسباب عدم وجود إشارات.
 
+import os, time, json, traceback, asyncio
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 import requests
-import pandas as pd
-import numpy as np
 import ccxt
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+import pandas as pd
 
-# ================== إعدادات عامة ==================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs")
-CHAT_ID = int(os.getenv("CHAT_ID", "8429537293"))
+# ====== إعدادات عامة ======
+EXCHANGE_NAME   = os.getenv("EXCHANGE", "bybit").lower()   # bybit / okx / kucoinfutures / binance
+TIMEFRAME       = os.getenv("TIMEFRAME", "5m")
+SYMBOLS_ENV     = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT")
+MAX_SYMBOLS     = int(os.getenv("MAX_SYMBOLS", "0"))       # 0 = لا حد
+SCAN_INTERVAL   = int(os.getenv("SCAN_INTERVAL", "60"))
+OHLCV_LIMIT     = int(os.getenv("OHLCV_LIMIT", "300"))
 
-# ترتيب المنصات للمحاولة التلقائية (يمكن تغييره من ENV: EXCHANGES)
-EXCHANGES = [x.strip() for x in os.getenv(
-    "EXCHANGES",
-    "okx,bitget,gateio,kraken,mexc,bybit,binance"
-).split(",") if x.strip()]
+# ====== Telegram (مزوّد من المستخدم) ======
+TELEGRAM_TOKEN = "8130568386:AAGmpxKQw1XhqNjtj2OBzJ_-e3_vn0FE5Bs"
+CHAT_ID        = 8429537293
 
-TIMEFRAME = os.getenv("TF", "5m")
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "45"))
-NO_SIGNAL_NOTIFY_EVERY = int(os.getenv("NO_SIGNAL_EVERY", "300"))
-
-ATR_MIN = float(os.getenv("ATR_MIN", "0.003"))
-ATR_MAX = float(os.getenv("ATR_MAX", "0.02"))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-TP_ATR = float(os.getenv("TP_ATR", "1.5"))
-SL_ATR = float(os.getenv("SL_ATR", "1.0"))
-
-PORT = int(os.getenv("PORT", "10000"))
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-# حالة التشغيل (المنصة المختارة ورموزها)
-RUNTIME: Dict[str, Any] = {"ex": None, "ex_name": None, "symmap": {}}
-
-# ================== Telegram Safe Sender ==================
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-def _post_tg(payload: Dict[str, Any]) -> Dict[str, Any]:
+# نخليها بدون parse_mode لتجنّب أخطاء HTML/Markdown، ونسمح بالـ reply
+def send_telegram(text: str, reply_to_message_id: Optional[int] = None) -> Optional[int]:
     try:
-        r = requests.post(f"{TELEGRAM_API}/sendMessage", data=payload, timeout=15)
-        if "application/json" in r.headers.get("content-type", ""):
-            data = r.json()
-        else:
-            data = {"ok": False, "description": r.text}
+        resp = requests.post(
+            TG_API,
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": True,
+                **({"reply_to_message_id": reply_to_message_id} if reply_to_message_id else {})
+            },
+            timeout=15
+        )
+        data = resp.json()
         if not data.get("ok"):
-            logging.warning(f"Telegram error: {data}")
-        return data
+            print(f"Telegram error: {data}")
+            return None
+        return data["result"]["message_id"]
     except Exception as e:
-        logging.exception("Telegram send exception")
-        return {"ok": False, "description": str(e)}
+        print(f"Telegram send error: {type(e).__name__}: {e}")
+        return None
 
-def tg_send(text: str, reply_to_message_id: Optional[int] = None, allow_html: bool = True) -> Optional[int]:
-    if len(text) > 4096:
-        text = text[:4090] + "…"
-    base = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
-    if reply_to_message_id:
-        base["reply_to_message_id"] = reply_to_message_id
-    if allow_html:
-        p = dict(base); p["parse_mode"] = "HTML"
-        d = _post_tg(p)
-        if d.get("ok"):
-            return d["result"]["message_id"]
-        desc = (d.get("description") or "").lower()
-        if "parse entities" in desc or "unsupported start tag" in desc:
-            p = dict(base); p["parse_mode"] = "HTML"; p["text"] = html.escape(text)
-            d = _post_tg(p)
-            if d.get("ok"):
-                return d["result"]["message_id"]
-    d = _post_tg(dict(base))
-    if d.get("ok"):
-        return d["result"]["message_id"]
-    return None
+# ====== إنشاء المنصّة عبر CCXT ======
+def make_exchange(name: str):
+    klass = {
+        "bybit": ccxt.bybit,
+        "okx": ccxt.okx,
+        "okx5": ccxt.okx,  # alias
+        "binance": ccxt.binance,
+        "kucoinfutures": ccxt.kucoinfutures,
+        "krakenfutures": ccxt.krakenfutures,
+        "bitget": ccxt.bitget,
+        "gate": ccxt.gate
+    }.get(name, ccxt.bybit)
 
-def tg_code(title: str, obj: Any, reply_to_message_id: Optional[int] = None) -> Optional[int]:
-    try:
-        if not isinstance(obj, str):
-            obj = json.dumps(obj, ensure_ascii=False, indent=2)
-    except Exception:
-        obj = str(obj)
-    body = f"<b>{html.escape(title)}</b>\n<pre>{html.escape(str(obj))[:3800]}</pre>"
-    return tg_send(body, reply_to_message_id=reply_to_message_id, allow_html=True)
+    # enableRateLimit مهم جدًا
+    exchange = klass({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",   # افتراضيًا: عقود دائمة
+        },
+        "timeout": 20000
+    })
+    return exchange
 
-# ================== مؤشرات ==================
+# ====== تحميل كل رموز الفيوتشرز تلقائيًا ======
+def list_all_futures_symbols(exchange) -> List[str]:
+    markets = exchange.load_markets()
+    syms = []
+    for m in markets.values():
+        # نأخذ أي عقد (perp/delivery) على الفيوتشرز (contract=True)
+        if m.get("contract") and (m.get("future") or m.get("swap")):
+            if m.get("active") is False:
+                continue
+            syms.append(m["symbol"])
+    # إزالة التكرارات وترتيب
+    syms = sorted(set(syms))
+    if MAX_SYMBOLS and MAX_SYMBOLS > 0:
+        syms = syms[:MAX_SYMBOLS]
+    return syms
+
+def parse_symbols_from_env(exchange, env_value: str) -> List[str]:
+    if env_value.strip().upper().startswith("AUTO_FUTURES"):
+        return list_all_futures_symbols(exchange)
+    # قائمة محددة
+    return [s.strip() for s in env_value.split(",") if s.strip()]
+
+# ====== أدوات مؤشرات بسيطة (EMA/RSI/Supertrend مختصرة) ======
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
 def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/n, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-9)
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(com= n-1, adjust=False).mean()
+    ma_down = down.ewm(com= n-1, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, 1e-10))
     return 100 - (100 / (1 + rs))
 
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.Series:
+    # ATR بسيط
+    hl = (df["high"] - df["low"]).abs()
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
 
-# ================== اختيار منصة تعمل ==================
-def _make_exchange(name: str):
-    cls = getattr(ccxt, name)
-    ex = cls({"enableRateLimit": True})
-    ex.options = {"adjustForTimeDifference": True}
-    return ex
+    hl2 = (df["high"] + df["low"]) / 2
+    upperband = hl2 + multiplier * atr
+    lowerband = hl2 - multiplier * atr
 
-def _find_symbol(markets: Dict[str, Any], wanted: str) -> Optional[str]:
-    if wanted in markets:
-        return wanted
-    # بدائل شائعة لبعض المنصات (خصوصاً Kraken و Gate)
-    base, quote = wanted.split("/")
-    aliases = [base]
-    if base == "BTC":
-        aliases += ["XBT"]
-    if base == "ETH":
-        aliases += ["XETH", "ETH"]
-    for m in markets.keys():
-        try:
-            b, q = m.split("/")
-        except Exception:
+    st = pd.Series(index=df.index, dtype=float)
+    dir_up = True
+    prev_st = None
+    for i in range(len(df)):
+        if i == 0:
+            st.iloc[i] = upperband.iloc[i]
+            prev_st = st.iloc[i]
             continue
-        if q == quote and b in aliases:
-            return m
-    # محاولة مرنة: تجاهل بادئة X
-    for m in markets.keys():
-        try:
-            b, q = m.split("/")
-        except Exception:
-            continue
-        if q == quote and b.replace("X", "") == base:
-            return m
+        if df["close"].iloc[i] > upperband.iloc[i-1]:
+            dir_up = True
+        elif df["close"].iloc[i] < lowerband.iloc[i-1]:
+            dir_up = False
+
+        if dir_up:
+            st.iloc[i] = max(lowerband.iloc[i], prev_st if prev_st else lowerband.iloc[i])
+        else:
+            st.iloc[i] = min(upperband.iloc[i], prev_st if prev_st else upperband.iloc[i])
+
+        prev_st = st.iloc[i]
+    return st
+
+# ====== منطق الإشارة ======
+def build_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
+    """
+    يرجّع:
+    - signal: dict أو None
+    - reasons: dict يشرح ليه ما فيه إشارة
+    """
+    reasons = {}
+    if df is None or len(df) < 60:
+        reasons["insufficient_data"] = f"candles={0 if df is None else len(df)} (<60)"
+        return None, reasons
+
+    close = df["close"]
+    ema50 = ema(close, 50)
+    ema200 = ema(close, 200)
+    r = rsi(close, 14)
+    st = supertrend(df, 10, 3.0)
+
+    last = df.index[-1]
+    c = close.loc[last]
+    e50 = float(ema50.loc[last])
+    e200 = float(ema200.loc[last])
+    r14 = float(r.loc[last])
+    stv = float(st.loc[last])
+
+    trend_up = e50 > e200
+    trend_down = e50 < e200
+    above_st = c > stv
+    below_st = c < stv
+
+    # شروط شراء/بيع بسيطة:
+    long_ok  = trend_up and above_st and (r14 > 45 and r14 < 75)
+    short_ok = trend_down and below_st and (r14 < 55 and r14 > 25)
+
+    if long_ok:
+        entry = c
+        sl = min(df["low"].tail(10))  # ستوب أسفل آخر قيعان
+        tp = entry * 1.01              # هدف 1%
+        return ({
+            "side": "LONG",
+            "entry": float(entry),
+            "tp": float(tp),
+            "sl": float(sl),
+        }, {})
+    if short_ok:
+        entry = c
+        sl = max(df["high"].tail(10))  # ستوب فوق آخر قمم
+        tp = entry * 0.99               # هدف 1%
+        return ({
+            "side": "SHORT",
+            "entry": float(entry),
+            "tp": float(tp),
+            "sl": float(sl),
+        }, {})
+
+    # أسباب عدم الإشارة
+    reasons["trend_up"] = trend_up
+    reasons["trend_down"] = trend_down
+    reasons["above_supertrend"] = above_st
+    reasons["below_supertrend"] = below_st
+    reasons["rsi14"] = round(r14, 2)
+    reasons["ema50_vs_ema200"] = f"{round(e50,2)} vs {round(e200,2)}"
+    return None, reasons
+
+# ====== جلب البيانات ======
+async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
+    try:
+        # بعض المنصات تحتاج params على futures، CCXT عادة يحلها
+        ohlcv = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv or len(ohlcv) < 10:
+            return None
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df.set_index("ts", inplace=True)
+        return df
+    except Exception as e:
+        return f"خطأ المنصة: {exchange.id} {type(e).__name__} {str(e)[:160]}"
+
+async def fetch_ticker_price(exchange, symbol: str) -> Optional[float]:
+    try:
+        t = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+        return float(t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice"))
+    except Exception:
+        return None
+
+# ====== حالة الإشارات المفتوحة للرد على الهدف/الستوب ======
+open_trades: Dict[str, Dict] = {}   # symbol -> {side, entry, tp, sl, msg_id}
+
+def crossed(side: str, price: float, tp: float, sl: float) -> Optional[str]:
+    if side == "LONG":
+        if price is not None and price >= tp: return "TP"
+        if price is not None and price <= sl: return "SL"
+    else:
+        if price is not None and price <= tp: return "TP"
+        if price is not None and price >= sl: return "SL"
     return None
 
-def pick_working_exchange(symbols: List[str], timeframe: str) -> Tuple[Any, str, Dict[str, str]]:
-    last_err = None
-    for name in EXCHANGES:
-        try:
-            ex = _make_exchange(name)
-            markets = ex.load_markets()
-            if not ex.has.get("fetchOHLCV"):
-                continue
-            symmap: Dict[str, str] = {}
-            ok = True
-            for s in symbols:
-                alt = _find_symbol(markets, s)
-                if not alt:
-                    ok = False
-                    break
-                symmap[s] = alt
-            if not ok:
-                continue
-            # تجربة سريعة
-            ex.fetch_ohlcv(list(symmap.values())[0], timeframe=timeframe, limit=2)
-            return ex, name, symmap
-        except Exception as e:
-            last_err = str(e)
-            if any(x in str(e) for x in ["403", "451", "Forbidden", "restricted", "Service unavailable"]):
-                continue
-    raise RuntimeError(last_err or "لم أجد منصة عامة تسمح من هذا السيرفر")
+# ====== دورة المسح ======
+async def scan_once(exchange, symbols: List[str], status_msg_id_holder: Dict[str, Optional[int]]):
+    no_signal_reasons: Dict[str, Dict] = {}
+    new_signals: List[Tuple[str, Dict]] = []
+    errors: Dict[str, str] = {}
 
-# ================== بناء إشارة ==================
-def build_signal(df: pd.DataFrame) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"side": None, "reasons": []}
-    if len(df) < max(ATR_PERIOD, RSI_PERIOD, 200):
-        out["reasons"].append("بيانات غير كافية")
-        return out
-    df["ema50"] = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
-    df["rsi"] = rsi(df["close"], RSI_PERIOD)
-    df["atr"] = atr(df, ATR_PERIOD)
+    # 1) فحص تحقق الهدف/الستوب للصفقات المفتوحة
+    for sym, pos in list(open_trades.items()):
+        price = await fetch_ticker_price(exchange, sym)
+        flag = crossed(pos["side"], price, pos["tp"], pos["sl"])
+        if flag:
+            txt = (f"🎯 *{flag}* تحقق لـ {sym}\n"
+                   f"نوع: {pos['side']}\n"
+                   f"سعر الدخول: {pos['entry']}\n"
+                   f"الهدف: {pos['tp']}\n"
+                   f"الستوب: {pos['sl']}\n"
+                   f"السعر الحالي: {price}")
+            # ما نستخدم parse_mode، فـ بنرسل نص عادي
+            send_telegram(txt, reply_to_message_id=pos.get("msg_id"))
+            del open_trades[sym]
 
-    c1, c2 = df.iloc[-2], df.iloc[-1]
-    close = float(c2["close"]); a = float(c2["atr"])
-    ema50, ema200 = float(c2["ema50"]), float(c2["ema200"])
-    rsi_prev, rsi_now = float(c1["rsi"]), float(c2["rsi"])
-    atr_pct = a / (close + 1e-9)
-
-    trend_up = ema50 > ema200
-    trend_down = ema50 < ema200
-    rsi_up = (rsi_prev <= 50) and (rsi_now > 50)
-    rsi_down = (rsi_prev >= 50) and (rsi_now < 50)
-    atr_ok = ATR_MIN <= atr_pct <= ATR_MAX
-
-    if atr_ok and trend_up and rsi_up and (close > ema50):
-        out["side"] = "long"
-        out["entry"] = close
-        out["sl"] = round(close - SL_ATR * a, 2)
-        out["tp"] = round(close + TP_ATR * a, 2)
-        out["reason"] = f"EMA50>200 + RSI↗ فوق 50 + ATR {atr_pct:.2%}"
-        return out
-    if atr_ok and trend_down and rsi_down and (close < ema50):
-        out["side"] = "short"
-        out["entry"] = close
-        out["sl"] = round(close + SL_ATR * a, 2)
-        out["tp"] = round(close - TP_ATR * a, 2)
-        out["reason"] = f"EMA50<200 + RSI↘ تحت 50 + ATR {atr_pct:.2%}"
-        return out
-
-    if not atr_ok:
-        out["reasons"].append(f"ATR خارج المدى ({atr_pct:.2%})")
-    if not (trend_up or trend_down):
-        out["reasons"].append("اتجاه غير واضح (EMA50≈EMA200)")
-    if not (rsi_up or rsi_down):
-        out["reasons"].append("لا يوجد كروس RSI حول 50")
-    if (trend_up and not (rsi_up and close > ema50)) or (trend_down and not (rsi_down and close < ema50)):
-        out["reasons"].append("شروط الدخول لم تكتمل")
-    return out
-
-# ================== إدارة صفقات ==================
-open_trades: Dict[str, Dict[str, Any]] = {}
-last_no_signal_sent = 0.0
-
-def fmt_price(p: float) -> str:
-    return f"{p:.2f}"
-
-def send_entry(symbol: str, sig: Dict[str, Any]) -> Optional[int]:
-    side = "🟢 شراء (LONG)" if sig["side"] == "long" else "🔴 بيع (SHORT)"
-    msg = (
-        f"<b>{html.escape(symbol)}</b>\n"
-        f"{side}\n"
-        f"السعر: <b>{fmt_price(sig['entry'])}</b>\n"
-        f"TP: <b>{fmt_price(sig['tp'])}</b> | SL: <b>{fmt_price(sig['sl'])}</b>\n"
-        f"السبب: {html.escape(sig['reason'])}"
-    )
-    return tg_send(msg, allow_html=True)
-
-def check_tp_sl(symbol: str, price: float):
-    trade = open_trades.get(symbol)
-    if not trade:
-        return
-    mid = trade["entry_msg_id"]
-    if trade["side"] == "long":
-        if price >= trade["tp"]:
-            tg_send(f"🎯 <b>{html.escape(symbol)}</b> تم تحقيق الهدف عند {fmt_price(trade['tp'])}", reply_to_message_id=mid)
-            open_trades.pop(symbol, None)
-        elif price <= trade["sl"]:
-            tg_send(f"⛔️ <b>{html.escape(symbol)}</b> تفعيل وقف الخسارة عند {fmt_price(trade['sl'])}", reply_to_message_id=mid)
-            open_trades.pop(symbol, None)
-    else:
-        if price <= trade["tp"]:
-            tg_send(f"🎯 <b>{html.escape(symbol)}</b> تم تحقيق الهدف (SHORT) عند {fmt_price(trade['tp'])}", reply_to_message_id=mid)
-            open_trades.pop(symbol, None)
-        elif price >= trade["sl"]:
-            tg_send(f"⛔️ <b>{html.escape(symbol)}</b> تفعيل وقف الخسارة (SHORT) عند {fmt_price(trade['sl'])}", reply_to_message_id=mid)
-            open_trades.pop(symbol, None)
-
-# ================== جلب البيانات ==================
-def fetch_ohlcv(ex, exch_symbol: str, limit: int = 300) -> pd.DataFrame:
-    data = ex.fetch_ohlcv(exch_symbol, timeframe=TIMEFRAME, limit=limit)
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
-    return df
-
-# ================== الحلقة الرئيسية ==================
-async def market_loop():
-    global last_no_signal_sent
-    tg_send(
-        "✅ <b>البوت اشتغل</b>\n"
-        f"TF: {TIMEFRAME}\nPairs: {', '.join(SYMBOLS)}",
-        allow_html=True,
-    )
-
-    # اختيار منصة تعمل
-    try:
-        ex, name, symmap = await asyncio.to_thread(pick_working_exchange, SYMBOLS, TIMEFRAME)
-        RUNTIME.update({"ex": ex, "ex_name": name, "symmap": symmap})
-        tg_code("تم اختيار المنصة تلقائياً", {"exchange": name, "symbols": symmap})
-    except Exception as e:
-        tg_code("فشل اختيار المنصة", {"error": str(e)})
-        return  # لا نكمل بدون منصة
-
-    while True:
-        had_signal = False
-        reasons: Dict[str, List[str]] = {}
-        need_repick = False
-
-        for sym in SYMBOLS:
-            ex = RUNTIME["ex"]
-            exch_sym = RUNTIME["symmap"].get(sym, sym)
-            try:
-                df = await asyncio.to_thread(fetch_ohlcv, ex, exch_sym, 300)
-            except Exception as e:
-                msg = str(e)
-                reasons[sym] = [f"خطأ المنصة: {msg[:160]}"]
-                if any(t in msg for t in ["403", "451", "Forbidden", "restricted", "Service unavailable"]):
-                    need_repick = True
-                await asyncio.sleep(0)
-                continue
-
-            sig = build_signal(df)
-            last_price = float(df["close"].iloc[-1])
-            check_tp_sl(sym, last_price)
-
-            if sig["side"]:
-                had_signal = True
-                if sym not in open_trades:
-                    mid = send_entry(sym, sig)
-                    if mid:
-                        open_trades[sym] = {
-                            "side": sig["side"],
-                            "entry": sig["entry"],
-                            "tp": sig["tp"],
-                            "sl": sig["sl"],
-                            "entry_msg_id": mid,
-                            "time": time.time(),
-                        }
+    # 2) فحص إشارات جديدة
+    sem = asyncio.Semaphore(8)  # حد التوازي لتجنب rate limit
+    async def process_symbol(symbol: str):
+        async with sem:
+            out = await fetch_ohlcv_safe(exchange, symbol, TIMEFRAME, OHLCV_LIMIT)
+            if isinstance(out, str):
+                errors[symbol] = out
+                return
+            if out is None:
+                no_signal_reasons[symbol] = {"insufficient_data": True}
+                return
+            sig, reasons = build_signal(out)
+            if sig:
+                new_signals.append((symbol, sig))
             else:
-                reasons[sym] = sig.get("reasons", ["غير محدد"])
+                no_signal_reasons[symbol] = reasons
 
-            await asyncio.sleep(0.25)
+    tasks = [asyncio.create_task(process_symbol(s)) for s in symbols]
+    await asyncio.gather(*tasks)
 
-        # تقرير "لا توجد إشارات"
-        now = time.time()
-        if (not had_signal) and (now - last_no_signal_sent >= NO_SIGNAL_NOTIFY_EVERY):
-            report = {k: ("، ".join(v) if v else "—") for k, v in reasons.items()}
-            tg_code("ℹ️ لا توجد إشارات حالياً – الأسباب", report)
-            last_no_signal_sent = now
+    # 3) إرسال ملخص
+    ex = exchange.id
+    tf = TIMEFRAME
+    head = (f"> توصيات تداول Ai:\n"
+            f"✅ البوت اشتغل\n"
+            f"Exchange: {ex}\nTF: {tf}\nPairs: {', '.join(symbols[:10])}"
+            + ("" if len(symbols) <= 10 else f" …(+{len(symbols)-10})"))
+    status_id = send_telegram(head)
+    status_msg_id_holder["id"] = status_id
 
-        # لو المنصة انحظرت فجأة، جرّب أخرى
-        if need_repick:
-            try:
-                ex, name, symmap = await asyncio.to_thread(pick_working_exchange, SYMBOLS, TIMEFRAME)
-                RUNTIME.update({"ex": ex, "ex_name": name, "symmap": symmap})
-                tg_code("تحويل تلقائي لمنصة بديلة", {"exchange": name, "symbols": symmap})
-            except Exception as e:
-                tg_code("فشل التحويل لمنصة بديلة", {"error": str(e)})
+    if new_signals:
+        for sym, s in new_signals:
+            txt = (f"🚀 إشارة جديدة\n"
+                   f"زوج: {sym}\n"
+                   f"نوع: {s['side']}\n"
+                   f"دخول: {s['entry']}\n"
+                   f"هدف: {s['tp']}\n"
+                   f"ستوب: {s['sl']}\n"
+                   f"TF: {tf}\n"
+                   f"الرجاء إدارة المخاطر.")
+            mid = send_telegram(txt, reply_to_message_id=status_id)
+            if mid:
+                open_trades[sym] = {**s, "msg_id": mid}
+    else:
+        # أسباب عدم وجود إشارات + أخطاء المنصة
+        bundle = {}
+        if no_signal_reasons:
+            bundle.update({k: v for k, v in list(no_signal_reasons.items())[:20]})  # لا نطوّل جدًا
+        if errors:
+            bundle.update({k: (errors[k][:200]) for k in list(errors.keys())[:10]})
+        send_telegram(
+            f"> توصيات تداول Ai:\nℹ️ لا توجد إشارات حاليًا – الأسباب\n{json.dumps(bundle, ensure_ascii=False, indent=2)}",
+            reply_to_message_id=status_id
+        )
 
+async def runner():
+    exchange = make_exchange(EXCHANGE_NAME)
+    # محاولة load_markets لمرة، مع معالجة حجب/أخطاء
+    try:
+        exchange.load_markets()  # sync ok
+    except Exception as e:
+        msg = (f"⚠️ فشل load_markets على {EXCHANGE_NAME}: {type(e).__name__} {str(e)[:180]}\n"
+               f"إذا ظهر 403/451 جرّب تغيير EXCHANGE لمنصة غير محجوبة.")
+        print(msg)
+        send_telegram(msg)
+        # نكمل لكن قد تفشل الأزواج
+    symbols = parse_symbols_from_env(exchange, SYMBOLS_ENV)
+    if not symbols:
+        send_telegram("⚠️ لم أجد أي أزواج. تأكد من SYMBOLS أو AUTO_FUTURES.")
+        return
+
+    status_msg_id_holder = {"id": None}
+
+    send_telegram("Starting bot… Telegram: ON")
+    while True:
+        try:
+            await scan_once(exchange, symbols, status_msg_id_holder)
+        except Exception as e:
+            err = f"Loop error: {type(e).__name__} {e}\n{traceback.format_exc()}"
+            print(err)
+            send_telegram(f"⚠️ Loop error:\n{err[:3500]}")
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ================== FastAPI ==================
+# ====== FastAPI واجهة بسيطة للصحة ======
+from fastapi import FastAPI
+import uvicorn
+
 app = FastAPI()
 
 @app.get("/")
 def root():
-    return JSONResponse({
+    return {
         "ok": True,
-        "service": "trading_bot",
-        "tf": TIMEFRAME,
-        "symbols": SYMBOLS,
-        "exchange": RUNTIME.get("ex_name"),
-        "mapped_symbols": RUNTIME.get("symmap"),
-    })
+        "exchange": EXCHANGE_NAME,
+        "timeframe": TIMEFRAME,
+        "symbols_mode": SYMBOLS_ENV,
+        "max_symbols": MAX_SYMBOLS,
+        "scan_interval": SCAN_INTERVAL
+    }
 
-@app.get("/scan")
-async def manual_scan():
-    try:
-        if RUNTIME["ex"] is None:
-            ex, name, symmap = await asyncio.to_thread(pick_working_exchange, SYMBOLS, TIMEFRAME)
-            RUNTIME.update({"ex": ex, "ex_name": name, "symmap": symmap})
-        ex = RUNTIME["ex"]; symmap = RUNTIME["symmap"]
-        out = {}
-        for s in SYMBOLS:
-            try:
-                df = await asyncio.to_thread(fetch_ohlcv, ex, symmap.get(s, s), 300)
-                out[s] = build_signal(df)
-            except Exception as e:
-                out[s] = {"error": str(e)}
-        return out
-    except Exception as e:
-        return {"error": str(e)}
-
+# on_event محذّر لكنه بسيط؛ Render لا يمانع هنا
 @app.on_event("startup")
-async def on_start():
-    asyncio.create_task(market_loop())
-    logging.info("Starting bot… Telegram: ON")
+async def _startup():
+    asyncio.create_task(runner())
 
-# ================== تشغيل محلي/Render ==================
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
