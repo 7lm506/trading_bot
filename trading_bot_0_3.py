@@ -1,12 +1,5 @@
-# trading_bot_hard_1_7.py
-# إعدادات داخل الكود بالكامل (بدون Environment)
-# المزايا:
-# - استراتيجية مرنة أقل تعجيزاً (RSI/بولنجر/ترند قابل للتخفيف)
-# - قائمة /start (إحصائيات، أسباب، آخر الإشارات، المفتوحة، تصدير CSV)
-# - تسجيل كل شيء في SQLite (bot_stats.db)
-# - منع سبام "لا توجد إشارات"
-# - keepalive اختياري
-# - فحص TP/SL برسائل تلقائية
+# trading_bot_hard_1_8.py
+# كل الإعدادات داخل الكود (بدون Environment)
 # المتطلبات: pip install ccxt fastapi uvicorn pandas requests
 
 import os, json, asyncio, time, io, csv, sqlite3, random
@@ -20,18 +13,18 @@ from fastapi import FastAPI
 import uvicorn
 
 # ========================== [ عدّل هنا فقط ] ==========================
-TELEGRAM_TOKEN = "PASTE_YOUR_TOKEN_HERE"   # ← ضع توكن البوت
-CHAT_ID        = "PASTE_YOUR_CHAT_ID_HERE" # ← ضع Chat ID
+TELEGRAM_TOKEN = "PASTE_YOUR_TOKEN_HERE"       # ← ضع توكن البوت
+CHAT_ID        = "PASTE_YOUR_CHAT_ID_HERE"     # ← ضع Chat ID (رقم)
 
 # المنصّة/الأزواج/الإطار
 EXCHANGE_NAME = "okx"           # okx / kucoinfutures / bybit / bitget / gate / binance
 TIMEFRAME     = "5m"
-SYMBOLS_MODE  = "ALL"           # "ALL" = كل عقود السواب/اللينيير. أو قائمة: "BTC/USDT,ETH/USDT"
+SYMBOLS_MODE  = "ALL"           # "ALL" = كل عقود السواب/اللينيير. أو "BTC/USDT,ETH/USDT"
 
 # حدود موثوقية/سيولة/تذبذب (مرنة)
-MIN_CONFIDENCE         = 55     # 55-65 بداية جيدة، ارفع لتقليل الإشارات
+MIN_CONFIDENCE         = 55     # ارفعها لتقليل الإشارات (مثلاً 60–65)
 MIN_ATR_PCT            = 0.10   # الحد الأدنى لحركة ATR% (0.10 = 0.1%)
-MIN_AVG_VOL_USDT       = 50_000 # الحد الأدنى للسيولة (USDT) على 30 شمعة
+MIN_AVG_VOL_USDT       = 50_000 # حد السيولة بالدولار على 30 شمعة
 
 # RSI (مرن)
 RSI_LONG_MIN,  RSI_LONG_MAX  = 40, 72
@@ -40,10 +33,10 @@ RSI_SHORT_MIN, RSI_SHORT_MAX = 28, 60
 # بولنجر: نطاق صارم + نطاق ألين
 BB_BANDWIDTH_MAX       = 0.045  # صارم
 BB_BANDWIDTH_MAX_SOFT  = 0.08   # ألين
-ALLOW_NO_SQUEEZE       = True   # اسمح بإشارة إذا كان الباند ضمن soft حتى لو تجاوز الصارم
+ALLOW_NO_SQUEEZE       = True   # اسمح بإشارة ضمن soft لو بقية الشروط قوية
 
 # فلتر الترند (EMA50 مقابل EMA200)
-REQUIRE_TREND          = False  # True = إشارات مع اتجاه فقط
+REQUIRE_TREND          = False  # True = إشارات باتجاه الترند فقط
 
 # أهداف/وقف
 TP_PCTS                = [0.25, 0.5, 1.0, 1.5]  # بالنسب المئوية
@@ -53,7 +46,7 @@ MIN_SL_PCT, MAX_SL_PCT = 0.30, 3.00
 
 # تبريد ومنع سبام
 SCAN_INTERVAL                 = 60     # ثانية بين الدورات
-MIN_SIGNAL_GAP_SEC            = 6      # فاصلة زمنية بين الرسائل
+MIN_SIGNAL_GAP_SEC            = 6      # فاصلة زمنية دنيا بين الرسائل
 MAX_ALERTS_PER_CYCLE          = 6      # أقصى إشارات لكل دورة
 COOLDOWN_PER_SYMBOL_CANDLES   = 8      # تبريد لكل رمز بالشموع المغلقة
 MAX_SYMBOLS                   = 120    # حد أقصى للأزواج (0 = بدون حد)
@@ -67,10 +60,10 @@ KEEPALIVE_URL      = ""               # مثال: "https://your-service.onrender
 KEEPALIVE_INTERVAL = 240              # ثواني
 
 # واجهة/نسخة
-APP_VERSION        = "1.7-hard"
-POLL_COMMANDS      = True
-POLL_INTERVAL      = 10   # فحص أوامر التلغرام كل n ثانية
-
+BUILD_UTC     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+APP_VERSION   = f"1.8 ({BUILD_UTC})"
+POLL_COMMANDS = True
+POLL_INTERVAL = 10   # فحص أوامر التلغرام كل n ثانية
 # ======================== [ لا تعدّل تحت غالباً ] ========================
 LOG_DB_PATH = "bot_stats.db"
 
@@ -284,7 +277,6 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         return None, {"index_error":True}
 
     atr_pct = 100*atr_now/max(c_now,1e-9)
-
     squeeze_strict = bw_now <= BB_BANDWIDTH_MAX
     squeeze_soft   = bw_now <= BB_BANDWIDTH_MAX_SOFT
     squeeze_ok     = squeeze_strict or (ALLOW_NO_SQUEEZE and squeeze_soft)
@@ -575,8 +567,12 @@ async def _startup():
     if not TELEGRAM_TOKEN or not CHAT_ID:
         raise SystemExit("ضع TELEGRAM_TOKEN و CHAT_ID في أعلى الملف.")
     db_init()
-    send_telegram(f"> توصيات تداول Ai v{APP_VERSION}:\n✅ البوت اشتغل\nExchange: (initializing)\nTF: {TIMEFRAME}\nPairs: (loading…)",
-                  reply_markup=start_menu_markup())
+    send_telegram(
+        f"> توصيات تداول Ai v{APP_VERSION}:\n"
+        f"✅ البوت اشتغل\n"
+        f"Exchange: (initializing)\nTF: {TIMEFRAME}\nPairs: (loading…)",
+        reply_markup=start_menu_markup()
+    )
     attempt_build()
     syms=app.state.symbols; ex_id=app.state.exchange_id
     head=f"> تحديث الإقلاع:\nExchange: {ex_id}\nTF: {TIMEFRAME}\nPairs: {', '.join([symbol_pretty(s) for s in syms[:10]])}{'' if len(syms)<=10 else f' …(+{len(syms)-10})'}"
