@@ -1,27 +1,24 @@
-# trading_bot_0_7.py
-# ميزات:
-# - Failover تلقائي بين عدة منصات إذا فشل load_markets (403/451/WAF)
-# - تقييد Bybit على linear swap + تطبيع الرموز :USDT
-# - عدم إرسال JSON فاضي؛ ولو مافيه رموز، يرسل تنبيه ذكي ويحاول إعادة التحميل دورياً
-# - رسالة التشغيل تُرسل مرة واحدة، وكل الرسائل لاحقًا Replies عليها
-# - AUTO_FUTURES + MAX_SYMBOLS + بارامترات OHLCV الصحيحة لكل منصة
-# - تقليل التوازي لتفادي RateLimit
+# trading_bot_smart_1_0.py
+# إستراتيجية: Smart Momentum + Volatility Compression Breakout
+# - يدعم كل عقود الفيوتشرز (AUTO_FUTURES) مع Failover تلقائي بين المنصات
+# - رسائل تيليجرام بأسلوب القنوات: دخول/وقف/4 أهداف + الرافعة
+# - إشارات edge-triggered على الشمعة المغلقة (i-1) + تبريد + منع تكرار
+# - تتبع TP1..TP4 و SL مع Replies على رسالة الإشارة الأصلية
 
-import os, json, asyncio, traceback, time
+import os, json, asyncio, time, traceback
 from typing import Dict, List, Optional, Tuple
 
 import requests
-import ccxt
 import pandas as pd
-
+import ccxt
 from fastapi import FastAPI
 import uvicorn
 
-# ===================== الإعدادات =====================
+# ==================== إعدادات عامة ====================
 EXCHANGE_NAME = os.getenv("EXCHANGE", "bybit").lower()
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
 SYMBOLS_ENV   = os.getenv("SYMBOLS", "AUTO_FUTURES")
-MAX_SYMBOLS   = int(os.getenv("MAX_SYMBOLS", "50"))   # جرّب 50 كبداية
+MAX_SYMBOLS   = int(os.getenv("MAX_SYMBOLS", "60"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 OHLCV_LIMIT   = int(os.getenv("OHLCV_LIMIT", "300"))
 
@@ -30,12 +27,20 @@ CHAT_ID        = os.getenv("CHAT_ID", "").strip()
 HTTP_PROXY     = os.getenv("HTTP_PROXY") or None
 HTTPS_PROXY    = os.getenv("HTTPS_PROXY") or None
 
+# استراتيجية: باراميترات قابلة للتعديل من البيئة
+COOLDOWN_CANDLES     = int(os.getenv("COOLDOWN_CANDLES", "3"))
+MIN_ENTRY_CHANGE_PCT = float(os.getenv("MIN_ENTRY_CHANGE_PCT", "0.15"))  # %
+BB_BANDWIDTH_MAX     = float(os.getenv("BB_BANDWIDTH_MAX", "0.04"))
+ATR_SL_MULT          = float(os.getenv("ATR_SL_MULT", "1.2"))
+TP_PCTS              = [float(x) for x in (os.getenv("TP_PCTS", "0.25,0.5,1.0,1.5")).split(",")]
+DEFAULT_LEVERAGE     = int(os.getenv("DEFAULT_LEVERAGE", "10"))
+
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("TELEGRAM_TOKEN و CHAT_ID مطلوبتان كمتغيرات بيئة.")
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# ===================== Telegram =====================
+# ==================== Telegram ====================
 def send_telegram(text: str, reply_to_message_id: Optional[int] = None) -> Optional[int]:
     try:
         resp = requests.post(
@@ -44,9 +49,9 @@ def send_telegram(text: str, reply_to_message_id: Optional[int] = None) -> Optio
                 "chat_id": CHAT_ID,
                 "text": text,
                 "disable_web_page_preview": True,
-                **({"reply_to_message_id": reply_to_message_id} if reply_to_message_id else {})
+                **({"reply_to_message_id": reply_to_message_id} if reply_to_message_id else {}),
             },
-            timeout=25
+            timeout=25,
         )
         data = resp.json()
         if not data.get("ok"):
@@ -57,7 +62,43 @@ def send_telegram(text: str, reply_to_message_id: Optional[int] = None) -> Optio
         print(f"Telegram send error: {type(e).__name__}: {e}")
         return None
 
-# ===================== CCXT / Exchanges =====================
+# ==================== مؤشرات مساعدة ====================
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    d = series.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    ma_up = up.ewm(com=n-1, adjust=False).mean()
+    ma_dn = dn.ewm(com=n-1, adjust=False).mean()
+    rs = ma_up / (ma_dn.replace(0, 1e-12))
+    return 100 - (100 / (1 + rs))
+
+def macd(series: pd.Series, fast=12, slow=26, signal_n=9) -> Tuple[pd.Series, pd.Series]:
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal = ema(macd_line, signal_n)
+    return macd_line, signal
+
+def bollinger(series: pd.Series, n=20, k=2.0) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    ma = series.rolling(n).mean()
+    sd = series.rolling(n).std(ddof=0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+    bandwidth = (upper - lower) / ma
+    return ma, upper, lower, bandwidth
+
+def atr(df: pd.DataFrame, n=14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([(h - l).abs(), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+def pct_diff(a: float, b: float) -> float:
+    return abs(a - b) / max(b, 1e-12) * 100.0
+
+# ==================== CCXT / Exchanges ====================
 EXCHANGE_CLASS_MAP = {
     "bybit": ccxt.bybit,
     "okx": ccxt.okx,
@@ -75,7 +116,7 @@ def make_exchange(name: str):
         "timeout": 20000,
         "options": {
             "defaultType": "swap",
-            "defaultSubType": "linear",  # مهم لبايبت
+            "defaultSubType": "linear",  # لبايبت
         },
     }
     if HTTP_PROXY or HTTPS_PROXY:
@@ -83,10 +124,6 @@ def make_exchange(name: str):
     return klass(cfg)
 
 def load_markets_linear_only(exchange) -> None:
-    """
-    يحاول تحميل الأسواق مقيدة للفيوتشرز/سواب (linear) مع backoff قصير.
-    يتوقف مبكرًا لو الخطأ 403/451/WAF.
-    """
     backoffs = [1.5, 3.0, 6.0]
     last_exc = None
     for i, wait in enumerate(backoffs, start=1):
@@ -114,93 +151,11 @@ def try_build_exchange_with_failover(primary: str, candidates: List[str]) -> Tup
         except Exception as e:
             last_err = e
             print(f"[failover] {name} failed: {type(e).__name__}: {str(e)[:220]}")
-            # جرّب التالي
     if last_err:
         raise last_err
     raise Exception("No exchanges available")
 
-# ===================== مؤشرات =====================
-def ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(span=n, adjust=False).mean()
-
-def rsi(series: pd.Series, n: int = 14) -> pd.Series:
-    d = series.diff()
-    up = d.clip(lower=0)
-    dn = -d.clip(upper=0)
-    ma_up = up.ewm(com=n-1, adjust=False).mean()
-    ma_dn = dn.ewm(com=n-1, adjust=False).mean()
-    rs = ma_up / (ma_dn.replace(0, 1e-10))
-    return 100 - (100 / (1 + rs))
-
-def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> pd.Series:
-    hl = (df["high"] - df["low"]).abs()
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    mid = (df["high"] + df["low"]) / 2
-    ub = mid + mult * atr
-    lb = mid - mult * atr
-    st = pd.Series(index=df.index, dtype=float)
-    dir_up = True
-    prev = None
-    for i in range(len(df)):
-        if i == 0:
-            st.iloc[i] = ub.iloc[i]
-            prev = st.iloc[i]
-            continue
-        if df["close"].iloc[i] > ub.iloc[i-1]:
-            dir_up = True
-        elif df["close"].iloc[i] < lb.iloc[i-1]:
-            dir_up = False
-        st.iloc[i] = max(lb.iloc[i], prev) if dir_up else min(ub.iloc[i], prev)
-        prev = st.iloc[i]
-    return st
-
-# ===================== منطق الإشارة =====================
-def build_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
-    reasons = {}
-    if df is None or len(df) < 60:
-        reasons["insufficient_data"] = f"candles={0 if df is None else len(df)} (<60)"
-        return None, reasons
-
-    close = df["close"]
-    e50 = float(ema(close, 50).iloc[-1])
-    e200 = float(ema(close, 200).iloc[-1])
-    r14 = float(rsi(close, 14).iloc[-1])
-    stv = float(supertrend(df, 10, 3.0).iloc[-1])
-    c = float(close.iloc[-1])
-
-    trend_up = e50 > e200
-    trend_down = e50 < e200
-    above_st = c > stv
-    below_st = c < stv
-
-    long_ok  = trend_up and above_st and (45 < r14 < 75)
-    short_ok = trend_down and below_st and (25 < r14 < 55)
-
-    if long_ok:
-        entry = c
-        sl = float(df["low"].tail(10).min())
-        tp = entry * 1.01
-        return ({"side": "LONG", "entry": entry, "tp": tp, "sl": sl}, {})
-    if short_ok:
-        entry = c
-        sl = float(df["high"].tail(10).max())
-        tp = entry * 0.99
-        return ({"side": "SHORT", "entry": entry, "tp": tp, "sl": sl}, {})
-
-    reasons.update({
-        "trend_up": trend_up,
-        "trend_down": trend_down,
-        "above_supertrend": above_st,
-        "below_supertrend": below_st,
-        "rsi14": round(r14, 2),
-        "ema50_vs_ema200": f"{round(e50,2)} vs {round(e200,2)}"
-    })
-    return None, reasons
-
-# ===================== رموز الفيوتشرز =====================
+# ==================== رموز الفيوتشرز ====================
 def normalize_symbols_for_exchange(exchange, symbols: List[str]) -> List[str]:
     if exchange.id == "bybit":
         out = []
@@ -213,7 +168,7 @@ def normalize_symbols_for_exchange(exchange, symbols: List[str]) -> List[str]:
     return symbols
 
 def list_all_futures_symbols(exchange) -> List[str]:
-    markets = exchange.markets  # بعد load_markets
+    markets = exchange.markets
     syms = []
     for m in markets.values():
         if m.get("contract") and (m.get("future") or m.get("swap")) and m.get("active", True) is not False:
@@ -232,7 +187,7 @@ def parse_symbols_from_env(exchange, env_value: str) -> List[str]:
         syms = syms[:MAX_SYMBOLS]
     return syms
 
-# ===================== جلب البيانات =====================
+# ==================== جلب البيانات ====================
 async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
     try:
         params = {}
@@ -240,11 +195,10 @@ async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
             params = {"category": "linear"}
         elif exchange.id == "okx":
             params = {"instType": "SWAP"}
-        # باقي المنصات غالبًا تعمل بدون params إضافية
         ohlcv = await asyncio.to_thread(
             exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, params=params
         )
-        if not ohlcv or len(ohlcv) < 10:
+        if not ohlcv or len(ohlcv) < 30:
             return None
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
@@ -260,21 +214,120 @@ async def fetch_ticker_price(exchange, symbol: str) -> Optional[float]:
     except Exception:
         return None
 
-# ===================== حالة الصفقات =====================
-open_trades: Dict[str, Dict] = {}  # symbol -> {side, entry, tp, sl, msg_id}
+# ==================== حالة الإشارات والصفقات ====================
+open_trades: Dict[str, Dict] = {}   # symbol -> {side, entry, sl, tps[], hit[], msg_id}
+signal_state: Dict[str, Dict] = {}  # symbol -> {last_entry, last_side, last_candle_idx, cooldown_until_idx}
 
-def crossed(side: str, price: Optional[float], tp: float, sl: float) -> Optional[str]:
+def symbol_pretty(sym: str) -> str:
+    # إزالة لاحقة :USDT من Bybit للعرض
+    return sym.replace(":USDT", "")
+
+# ==================== الإستراتيجية (Edge-Triggered) ====================
+def smart_breakout_strategy(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
+    """
+    LONG:
+      - ضيق بولنجر (bandwidth <= BB_BANDWIDTH_MAX)
+      - إغلاق الشمعة (i-1) فوق الحد العلوي، وكان (i-2) داخل/تحته
+      - MACD(i-1) > Signal(i-1)
+      - 45 < RSI(i-1) < 70
+    SHORT:
+      - ضيق بولنجر
+      - إغلاق (i-1) تحت الحد السفلي، وكان (i-2) داخل/فوقه
+      - MACD < Signal
+      - 30 < RSI < 55
+    SL = ATR(14) * ATR_SL_MULT
+    TP4..TP1 حسب TP_PCTS%
+    """
+    reasons = {}
+    if df is None or len(df) < 60:
+        reasons["insufficient_data"] = f"candles={0 if df is None else len(df)} (<60)"
+        return None, reasons
+
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+
+    ma, bb_up, bb_dn, bb_bw = bollinger(close, n=20, k=2.0)
+    macd_line, macd_sig = macd(close, 12, 26, 9)
+    r = rsi(close, 14)
+    atr14 = atr(df, 14)
+
+    # نعمل على الشمعة المغلقة الأخيرة i-1 والإحدى قبلها i-2
+    i2, i1 = -3, -2
+    try:
+        c_prev, c_now = float(close.iloc[i2]), float(close.iloc[i1])
+        up_prev, up_now = float(bb_up.iloc[i2]), float(bb_up.iloc[i1])
+        dn_prev, dn_now = float(bb_dn.iloc[i2]), float(bb_dn.iloc[i1])
+        bw_now = float(bb_bw.iloc[i1])
+        macd_now = float(macd_line.iloc[i1]); sig_now = float(macd_sig.iloc[i1])
+        r14 = float(r.iloc[i1])
+        atr_now = float(atr14.iloc[i1])
+    except Exception:
+        reasons["index_error"] = True
+        return None, reasons
+
+    # ضيق
+    is_squeeze = bw_now <= BB_BANDWIDTH_MAX
+
+    # عبور
+    crossed_up   = (c_prev <= up_prev) and (c_now > up_now)
+    crossed_down = (c_prev >= dn_prev) and (c_now < dn_now)
+
+    long_ok  = is_squeeze and crossed_up   and (macd_now > sig_now) and (45 < r14 < 70)
+    short_ok = is_squeeze and crossed_down and (macd_now < sig_now) and (30 < r14 < 55)
+
+    if not (long_ok or short_ok):
+        reasons.update({
+            "squeeze": is_squeeze,
+            "cross_up": crossed_up,
+            "cross_down": crossed_down,
+            "macd_vs_signal": f"{round(macd_now,4)} vs {round(sig_now,4)}",
+            "rsi14": round(r14,2),
+            "note": "no edge-triggered breakout on closed candle"
+        })
+        return None, reasons
+
+    # إعداد SL و TPs
+    entry = c_now
+    sl_dist = ATR_SL_MULT * max(atr_now, 1e-12)
+    if long_ok:
+        sl = entry - sl_dist
+        tps = [entry * (1 + p/100.0) for p in TP_PCTS]  # تصاعدي
+        side = "LONG"
+    else:
+        sl = entry + sl_dist
+        # للأهداف التنازلية نطرح %
+        tps = [entry * (1 - p/100.0) for p in TP_PCTS]  # تنازلي
+        side = "SHORT"
+
+    return ({
+        "side": side,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tps": [float(x) for x in tps],
+        "candle_i1_ts": int(df.index[i1].value // 1e9)  # للتهدئة
+    }, {})
+
+# ==================== تحقُّق الأهداف/الستوب ====================
+def crossed_levels(side: str, price: float, tps: List[float], sl: float, hit: List[bool]) -> Optional[Tuple[str, int]]:
     if price is None:
         return None
-    if side == "LONG":
-        if price >= tp: return "TP"
-        if price <= sl: return "SL"
-    else:
-        if price <= tp: return "TP"
-        if price >= sl: return "SL"
+    # SL أولًا
+    if side == "LONG" and price <= sl:
+        return ("SL", -1)
+    if side == "SHORT" and price >= sl:
+        return ("SL", -1)
+    # تحقق TP بالترتيب
+    for idx, (tp, was_hit) in enumerate(zip(tps, hit)):
+        if was_hit:
+            continue
+        if side == "LONG" and price >= tp:
+            return ("TP", idx)
+        if side == "SHORT" and price <= tp:
+            return ("TP", idx)
     return None
 
-# ===================== FastAPI =====================
+# ==================== FastAPI ====================
 app = FastAPI()
 
 @app.get("/")
@@ -288,92 +341,196 @@ def root():
         "scan_interval": SCAN_INTERVAL,
         "open_trades": len(open_trades),
         "symbols_count": len(getattr(app.state, "symbols", [])),
-        "failover_used": getattr(app.state, "exchange_id", EXCHANGE_NAME),
+        "params": {
+            "BB_BANDWIDTH_MAX": BB_BANDWIDTH_MAX,
+            "ATR_SL_MULT": ATR_SL_MULT,
+            "TP_PCTS": TP_PCTS,
+            "COOLDOWN_CANDLES": COOLDOWN_CANDLES,
+            "MIN_ENTRY_CHANGE_PCT": MIN_ENTRY_CHANGE_PCT
+        }
     }
 
-# ===================== المسح =====================
-async def scan_once(exchange, symbols: List[str], status_msg_id_holder: Dict[str, Optional[int]]):
-    # لو مافيه رموز، لا نرسل JSON فاضي؛ نترك runner يحاول إعادة التحميل
-    if not symbols:
-        # أرسل تذكير ذكي مرة كل عدة دورات فقط (يُدار في runner)
-        return
+# ==================== حلقة المسح ====================
+async def fetch_and_signal(exchange, symbol: str, timeframe: str, holder: Dict[str, Optional[int]]):
+    out = await fetch_ohlcv_safe(exchange, symbol, timeframe, OHLCV_LIMIT)
+    if isinstance(out, str):
+        return ("error", symbol, out)
+    if out is None or len(out) < 60:
+        return ("no_data", symbol, {"insufficient_data": True})
 
-    no_signal_reasons: Dict[str, Dict] = {}
-    new_signals: Dict[str, Dict] = {}
-    errors: Dict[str, str] = {}
+    # إذا هناك صفقة مفتوحة، لا تعطي إشارة جديدة بنفس الاتجاه
+    if symbol in open_trades:
+        return ("open_trade", symbol, {})
 
-    # تحقق TP/SL
+    sig, reasons = smart_breakout_strategy(out)
+    if not sig:
+        # نضمن أسباب غير فارغة
+        if not reasons:
+            reasons = {"note": "no setup"}
+        return ("no_signal", symbol, reasons)
+
+    # تبريد/منع تكرار
+    st = signal_state.get(symbol, {})
+    last_entry = st.get("last_entry")
+    last_side  = st.get("last_side")
+    last_idx   = st.get("last_candle_idx", -1)
+    cooldown_until = st.get("cooldown_until_idx", -999999)
+
+    # الشمعة المغلقة نعتبرها index = len(out)-2
+    closed_idx = len(out) - 2
+
+    # تبريد
+    if closed_idx < cooldown_until:
+        return ("cooldown", symbol, {"cooldown_until_idx": cooldown_until})
+
+    # لو نفس الاتجاه وفارق الدخول قريب، تجاهل
+    if last_side == sig["side"] and last_entry is not None:
+        if pct_diff(sig["entry"], float(last_entry)) < MIN_ENTRY_CHANGE_PCT:
+            return ("near_dupe", symbol, {"last_entry": last_entry, "new_entry": sig["entry"]})
+
+    # جهّز رسالة القناة
+    pretty = symbol_pretty(symbol)
+    side_txt = "طويل 🟢" if sig["side"] == "LONG" else "قصير 🔴"
+    header = f"#{pretty} - {side_txt}"
+    entry = sig["entry"]; sl = sig["sl"]; tps = sig["tps"]
+    lev = DEFAULT_LEVERAGE
+
+    msg = (
+        f"{header}\n\n"
+        f"نقطة الدخول: {entry}\n"
+        f"وقف الخسارة: {sl}\n\n"
+        f"الهدف 1: {tps[0]}\n"
+        f"الهدف 2: {tps[1]}\n"
+        f"الهدف 3: {tps[2]}\n"
+        f"الهدف 4: {tps[3]}\n\n"
+        f"الرفع: x{lev}"
+    )
+
+    mid = send_telegram(msg, reply_to_message_id=holder.get("id"))
+    if mid:
+        open_trades[symbol] = {
+            "side": sig["side"],
+            "entry": entry,
+            "sl": sl,
+            "tps": tps,
+            "hit": [False, False, False, False],
+            "msg_id": mid
+        }
+        # سجل حالة الإشارة
+        signal_state[symbol] = {
+            "last_entry": entry,
+            "last_side": sig["side"],
+            "last_candle_idx": closed_idx,
+            "cooldown_until_idx": closed_idx + COOLDOWN_CANDLES
+        }
+
+    return ("signal", symbol, sig)
+
+async def check_open_trades(exchange, holder: Dict[str, Optional[int]]):
+    # تحقق TP/SL لكل صفقة مفتوحة
     for sym, pos in list(open_trades.items()):
         price = await fetch_ticker_price(exchange, sym)
-        flag = crossed(pos["side"], price, pos["tp"], pos["sl"])
-        if flag:
+        res = crossed_levels(pos["side"], price, pos["tps"], pos["sl"], pos["hit"])
+        if not res:
+            continue
+        kind, idx = res
+        if kind == "SL":
             txt = (
-                f"🎯 {flag} تحقق لـ {sym}\n"
+                f"🛑 SL تحقق لـ {symbol_pretty(sym)}\n"
                 f"نوع: {pos['side']}\n"
-                f"سعر الدخول: {pos['entry']}\n"
-                f"الهدف: {pos['tp']}\n"
-                f"الستوب: {pos['sl']}\n"
+                f"دخول: {pos['entry']}\n"
+                f"ستوب: {pos['sl']}\n"
                 f"السعر الحالي: {price}"
             )
-            send_telegram(txt, reply_to_message_id=pos.get("msg_id"))
+            send_telegram(txt, reply_to_message_id=pos["msg_id"])
             del open_trades[sym]
-
-    # إشارات جديدة
-    sem = asyncio.Semaphore(2)  # تقليل التوازي
-
-    async def process_symbol(symbol: str):
-        async with sem:
-            out = await fetch_ohlcv_safe(exchange, symbol, TIMEFRAME, OHLCV_LIMIT)
-            if isinstance(out, str):
-                errors[symbol] = out
-                return
-            if out is None:
-                no_signal_reasons[symbol] = {"insufficient_data": True}
-                return
-            sig, reasons = build_signal(out)
-            if sig:
-                new_signals[symbol] = sig
-            else:
-                no_signal_reasons[symbol] = reasons
-
-    await asyncio.gather(*[asyncio.create_task(process_symbol(s)) for s in symbols])
-
-    status_id = status_msg_id_holder.get("id")
-
-    if new_signals:
-        for sym, s in new_signals.items():
+        else:
+            pos["hit"][idx] = True
+            tp_price = pos["tps"][idx]
             txt = (
-                f"🚀 إشارة جديدة\n"
-                f"زوج: {sym}\n"
-                f"نوع: {s['side']}\n"
-                f"دخول: {s['entry']}\n"
-                f"هدف: {s['tp']}\n"
-                f"ستوب: {s['sl']}\n"
-                f"TF: {TIMEFRAME}\n"
-                f"الرجاء إدارة المخاطر."
+                f"🎯 TP{idx+1} تحقق لـ {symbol_pretty(sym)}\n"
+                f"نوع: {pos['side']}\n"
+                f"دخول: {pos['entry']}\n"
+                f"الهدف {idx+1}: {tp_price}\n"
+                f"ستوب: {pos['sl']}\n"
+                f"السعر الحالي: {price}"
             )
-            mid = send_telegram(txt, reply_to_message_id=status_id)
-            if mid:
-                open_trades[sym] = {**s, "msg_id": mid}
-    else:
+            send_telegram(txt, reply_to_message_id=pos["msg_id"])
+            # إغلاق الصفقة بعد TP4
+            if all(pos["hit"]):
+                del open_trades[sym]
+
+# ==================== Runner ====================
+async def scan_once(exchange, symbols: List[str], holder: Dict[str, Optional[int]]):
+    await check_open_trades(exchange, holder)
+
+    if not symbols:
+        return ("no_symbols", {})
+
+    sem = asyncio.Semaphore(2)  # تقليل التوازي لتفادي RateLimit
+    results = {"signals": {}, "no_signals": {}, "errors": {}}
+
+    async def worker(sym: str):
+        async with sem:
+            res_type, s, payload = await fetch_and_signal(exchange, sym, TIMEFRAME, holder)
+            if res_type == "signal":
+                results["signals"][s] = payload
+            elif res_type == "error":
+                results["errors"][s] = payload
+            elif res_type in ("no_signal", "no_data", "open_trade", "cooldown", "near_dupe"):
+                results["no_signals"][s] = payload
+            # else: ignore
+
+    await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
+
+    # لو لا إشارات جديدة: أرسل أسباب مختصرة (عينة)
+    if not results["signals"]:
         bundle = {}
-        if no_signal_reasons:
-            for k, v in list(no_signal_reasons.items())[:20]:
-                bundle[k] = v
-        if errors:
-            for k, v in list(errors.items())[:10]:
-                bundle[k] = v[:200]
+        # خذ أول 15 رمز من أسباب "no_signals"
+        for k, v in list(results["no_signals"].items())[:15]:
+            bundle[k] = v
+        # وأول 8 أخطاء
+        for k, v in list(results["errors"].items())[:8]:
+            bundle[k] = str(v)[:200]
         send_telegram(
             f"> توصيات تداول Ai:\nℹ️ لا توجد إشارات حاليًا – الأسباب\n{json.dumps(bundle, ensure_ascii=False, indent=2) if bundle else '—'}",
-            reply_to_message_id=status_id
+            reply_to_message_id=holder.get("id")
         )
 
-# ===================== Runner + Startup =====================
+    return ("done", results)
+
+# ==================== Startup / Failover ====================
+app = FastAPI()
+
+@app.on_event("startup")
+async def _startup():
+    # رسالة تشغيل مرة واحدة
+    head = (f"> توصيات تداول Ai:\n"
+            f"✅ البوت اشتغل\n"
+            f"Exchange: (initializing)\nTF: {TIMEFRAME}\n"
+            f"Pairs: (loading…)")
+    status_id = send_telegram(head)
+
+    app.state.status_msg_id_holder = {"id": status_id}
+    app.state.exchange = make_exchange(EXCHANGE_NAME)  # placeholder
+    app.state.exchange_id = EXCHANGE_NAME
+    app.state.symbols = []
+
+    # Failover أولي
+    await attempt_reload_symbols(app.state)
+
+    # تحديث الرأسية
+    ex_id = getattr(app.state, "exchange_id", EXCHANGE_NAME)
+    syms = getattr(app.state, "symbols", [])
+    upd = (f"> تحديث الإقلاع:\n"
+           f"Exchange: {ex_id}\nTF: {TIMEFRAME}\n"
+           f"Pairs: {', '.join([symbol_pretty(s) for s in syms[:10]])}" +
+           ("" if len(syms) <= 10 else f" …(+{len(syms)-10})"))
+    send_telegram(upd, reply_to_message_id=status_id)
+
+    asyncio.create_task(runner())
+
 async def attempt_reload_symbols(app_state) -> None:
-    """
-    يحاول بناء منصة مع Failover ثم تحميل الأسواق واستخراج الرموز.
-    يحدّث app.state عند النجاح.
-    """
     fallbacks = ["okx", "kucoinfutures", "bitget", "gate", "binance"]
     try:
         ex, used = try_build_exchange_with_failover(EXCHANGE_NAME, fallbacks)
@@ -383,76 +540,41 @@ async def attempt_reload_symbols(app_state) -> None:
         app_state.symbols = syms
         print(f"[reload] success on {used}, symbols={len(syms)}")
     except Exception as e:
-        # أبقِ الحالة كما هي؛ المحاولة القادمة لاحقاً
         print(f"[reload] failed: {type(e).__name__}: {str(e)[:220]}")
 
 async def runner():
     holder = app.state.status_msg_id_holder
-    empty_symbols_notify_every = 5   # كل 5 دورات
+    empty_notify_every = 5
     empty_counter = 0
-
     while True:
         try:
             ex = app.state.exchange
             syms = app.state.symbols
-
             if not syms:
                 empty_counter += 1
-                # أرسل تنبيه كل N دورات فقط
-                if empty_counter % empty_symbols_notify_every == 1:
+                if empty_counter % empty_notify_every == 1:
                     send_telegram(
-                        "> ملاحظة: لا توجد رموز مُحمّلة بعد.\n"
-                        "سأعيد محاولة تحميل الأسواق/المنصة تلقائيًا (failover) خلال الدورات القادمة.",
+                        "> ملاحظة: لا توجد رموز مُحمّلة بعد. سأحاول إعادة تحميل الأسواق تلقائيًا (failover).",
                         reply_to_message_id=holder.get("id")
                     )
-                # جرّب إعادة التحميل
                 await attempt_reload_symbols(app.state)
             else:
-                # عند وجود رموز، نفّذ دورة المسح
                 await scan_once(ex, syms, holder)
-
         except Exception as e:
             err = f"Loop error: {type(e).__name__} {e}\n{traceback.format_exc()}"
             print(err)
             send_telegram(f"⚠️ Loop error:\n{err[:3500]}", reply_to_message_id=holder.get("id"))
-
         await asyncio.sleep(SCAN_INTERVAL)
 
-app = FastAPI()
-
-@app.on_event("startup")
-async def _startup():
-    # إعداد رسالة التشغيل (نرسلها مهما كان)
-    head = (f"> توصيات تداول Ai:\n"
-            f"✅ البوت اشتغل\n"
-            f"Exchange: (initializing)\nTF: {TIMEFRAME}\n"
-            f"Pairs: (loading…)")
-    status_id = send_telegram(head)
-
-    # جهّز حالة التطبيق
-    app.state.status_msg_id_holder = {"id": status_id}
-    app.state.exchange = make_exchange(EXCHANGE_NAME)  # placeholder
-    app.state.exchange_id = EXCHANGE_NAME
-    app.state.symbols = []
-
-    # أول محاولة تحميل + Failover
-    await attempt_reload_symbols(app.state)
-
-    # بعد أول محاولة، عدّل الرسالة الرأسية بمعلومة أوضح (Reply تحديثي صغير)
-    ex_id = getattr(app.state, "exchange_id", EXCHANGE_NAME)
-    syms = getattr(app.state, "symbols", [])
-    upd = (f"> تحديث الإقلاع:\n"
-           f"Exchange: {ex_id}\nTF: {TIMEFRAME}\n"
-           f"Pairs: {', '.join(syms[:10])}" + ("" if len(syms) <= 10 else f" …(+{len(syms)-10})"))
-    send_telegram(upd, reply_to_message_id=status_id)
-
-    # شغّل الحلقة
-    asyncio.create_task(runner())
-
-# نقطة صحة
+# نقطة صحة إضافية
 @app.get("/health")
 def health():
-    return {"ok": True, "exchange": getattr(app.state, "exchange_id", EXCHANGE_NAME), "symbols": len(getattr(app.state, "symbols", []))}
+    return {
+        "ok": True,
+        "exchange": getattr(app.state, "exchange_id", EXCHANGE_NAME),
+        "symbols": len(getattr(app.state, "symbols", [])),
+        "open_trades": len(open_trades),
+    }
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
