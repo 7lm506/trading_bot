@@ -1,8 +1,9 @@
-# trading_bot_menu_1_4.py
-# - نفس منطق الإشارات السابق (فلاتر + نسبة ثقة + SL واقعي)
-# - قائمة /start (ReplyKeyboard) لأوامر: الإحصائيات، الأسباب، التصدير، آخر الإشارات، المفتوحة، مساعدة
-# - Polling ثابت للأوامر (مع deleteWebhook و offset)
-# - حفظ كل شيء في SQLite (bot_stats.db)
+# trading_bot_menu_1_5.py
+# Fixes:
+# - Keepalive ping to prevent Render idle sleep
+# - Solid Telegram polling (deleteWebhook + offset + retries)
+# - ReplyKeyboard /start menu with working buttons
+# - (Strategy & scanning نفس السابق، بلا تغييرات على شروط الدخول)
 
 import os, json, asyncio, time, io, csv, sqlite3, random, traceback
 from typing import Dict, List, Optional, Tuple
@@ -30,7 +31,7 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 HTTP_PROXY = os.getenv("HTTP_PROXY") or None
 HTTPS_PROXY= os.getenv("HTTPS_PROXY") or None
 
-# Strategy (نفس القيم السابقة؛ عدّلها من الـ Env إذا تبغى لاحقًا)
+# Strategy (كما هي)
 COOLDOWN_CANDLES         = int(os.getenv("COOLDOWN_CANDLES","3"))
 BB_BANDWIDTH_MAX         = float(os.getenv("BB_BANDWIDTH_MAX","0.035"))
 ATR_SL_MULT              = float(os.getenv("ATR_SL_MULT","1.5"))
@@ -54,6 +55,10 @@ POLL_COMMANDS            = os.getenv("POLL_COMMANDS","true").lower()=="true"
 POLL_INTERVAL            = int(os.getenv("POLL_INTERVAL","10"))
 SEND_NO_SIGNAL_SUMMARY   = os.getenv("SEND_NO_SIGNAL_SUMMARY","false").lower()=="true"
 
+# Keepalive لمنع الإطفاء
+KEEPALIVE_URL            = (os.getenv("KEEPALIVE_URL") or "").strip()
+KEEPALIVE_INTERVAL       = int(os.getenv("KEEPALIVE_INTERVAL","240"))  # 4 دقائق
+
 # ================= Telegram =================
 TG_API   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 SEND_URL = TG_API + "/sendMessage"
@@ -63,9 +68,12 @@ TG_DELETE_WEBHOOK   = TG_API + "/deleteWebhook"
 
 _last_send_ts = 0
 def _reply_kb(rows: List[List[str]]) -> str:
-    # ReplyKeyboardMarkup
-    return json.dumps({"keyboard":[[{"text":t} for t in row] for row in rows],
-                       "resize_keyboard": True})
+    return json.dumps({
+        "keyboard":[[{"text":t} for t in row] for row in rows],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True
+    })
 
 def send_telegram(text: str, reply_to_message_id: Optional[int]=None,
                   reply_markup: Optional[str]=None) -> Optional[int]:
@@ -101,11 +109,11 @@ def start_menu_markup() -> str:
     return _reply_kb([
         ["📊 الإحصائيات", "📄 الأسباب"],
         ["📜 آخر الإشارات", "📌 المفتوحة"],
-        ["⬇️ تصدير CSV", "ℹ️ مساعدة"]
+        ["⬇️ تصدير CSV", "🔁 تحديث القائمة"]
     ])
 
 def send_start_menu():
-    send_telegram("اختر أمرًا:", reply_markup=start_menu_markup())
+    send_telegram("القائمة الرئيسية:", reply_markup=start_menu_markup())
 
 # ================ Indicators ================
 def ema(s: pd.Series, n:int)->pd.Series: return s.ewm(span=n, adjust=False).mean()
@@ -295,7 +303,7 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     conf = compute_confidence(df, side, bw_now, c_prev, c_now, (up_prev if side=="LONG" else dn_prev),
                               band_now, macd_now, sig_now, r14, atr_now)
 
-    # SL واقعي: swing + ATR + حدود %
+    # SL واقعي
     recent_lows  = float(l.tail(SL_LOOKBACK).min())
     recent_highs = float(h.tail(SL_LOOKBACK).max())
     entry=c_now; atr_dist = ATR_SL_MULT*max(atr_now,1e-12)
@@ -422,14 +430,14 @@ async def scan_once(ex, symbols:List[str], holder):
     if not symbols: return
     random.shuffle(symbols)
     sem=asyncio.Semaphore(3)
-    async def worker(s): 
+    async def worker(s):
         async with sem: await fetch_and_signal(ex,s,holder)
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
     if SEND_NO_SIGNAL_SUMMARY and _last_cycle_alerts==0:
         send_telegram("> ℹ️ لا توجد إشارات بهذه الدورة (الأسباب محفوظة في القاعدة).",
                       reply_to_message_id=holder.get("id"))
 
-# ================ Stats/Reasons/Export (Text builders) ================
+# ================ Text builders ================
 def stats_text(days: int = 1) -> str:
     try:
         con = db_conn(); cur = con.cursor()
@@ -439,11 +447,12 @@ def stats_text(days: int = 1) -> str:
                          SUM(CASE WHEN event LIKE 'TP%' THEN 1 ELSE 0 END),
                          SUM(CASE WHEN event='SL' THEN 1 ELSE 0 END)
                        FROM outcomes WHERE ts >= strftime('%s','now', ?)""", (f"-{days} day",))
-        tp, sl = (cur.fetchone() or (0,0))
+        row = cur.fetchone() or (0,0)
+        tp, sl = row[0] or 0, row[1] or 0
         con.close()
-        if total==0 and (tp or sl)==0: return "لا توجد بيانات كافية بعد."
+        if total==0 and tp==0 and sl==0: return "لا توجد بيانات كافية بعد."
         return (f"📊 إحصائيات آخر {days} يوم:\n"
-                f"- إشارات: {total}\n- TP: {tp or 0}\n- SL: {sl or 0}")
+                f"- إشارات: {total}\n- TP: {tp}\n- SL: {sl}")
     except Exception as e:
         return f"⚠️ خطأ الإحصائيات: {e}"
 
@@ -519,7 +528,7 @@ def parse_cmd(text:str)->Tuple[str,str]:
         arg=parts[1].strip() if len(parts)>1 else ""
         if "@" in cmd: cmd=cmd.split("@",1)[0]
         return cmd,arg
-    # أزرار القائمة ترجع نصوص عادية:
+    # أزرار القائمة ترجع نصوص عادية
     normalized=t.strip()
     return normalized, ""
 
@@ -539,14 +548,14 @@ async def poll_telegram_commands():
                     text=msg.get("text","")
                     cmd,arg=parse_cmd(text)
 
-                    if cmd in ("/start","ℹ️ مساعدة"):
-                        send_telegram("القائمة الرئيسية:", reply_markup=start_menu_markup())
+                    if cmd in ("/start","🔁 تحديث القائمة"):
+                        send_start_menu()
                     elif cmd in ("📊 الإحصائيات","/stats"):
                         days = 1
                         if arg.isdigit(): days=int(arg)
                         send_telegram(stats_text(days))
                     elif cmd in ("📄 الأسباب","/reasons","/reason"):
-                        win = arg.strip() or "1d"   # أمثلة: 6h, 3d
+                        win = arg.strip() or "1d"   # أمثلة: 6h, 3d, 1d
                         send_telegram(reasons_text(win))
                     elif cmd in ("📜 آخر الإشارات","/last"):
                         lim = int(arg) if arg.isdigit() else 10
@@ -557,11 +566,21 @@ async def poll_telegram_commands():
                         days=int(arg) if arg.isdigit() else 14
                         send_document(f"signals_{days}d.csv", export_csv_bytes(days), caption="تصدير الإشارات")
                     else:
-                        # أي نص غير معروف نرجعه للقائمة
+                        # أي نص غير معروف -> أعد القائمة
                         send_start_menu()
         except Exception as e:
             print("poll error:", e)
         await asyncio.sleep(POLL_INTERVAL)
+
+# ================ Keepalive (منع الإطفاء) ================
+async def keepalive_task():
+    if not KEEPALIVE_URL: return
+    while True:
+        try:
+            requests.get(KEEPALIVE_URL, timeout=10)
+        except Exception as e:
+            print("keepalive error:", e)
+        await asyncio.sleep(max(60, KEEPALIVE_INTERVAL))
 
 # ================ Startup / Runner ================
 app.state.exchange=None; app.state.exchange_id=EXCHANGE_NAME; app.state.symbols=[]
@@ -581,8 +600,10 @@ async def _startup():
     syms=app.state.symbols; ex_id=app.state.exchange_id
     send_telegram(f"> تحديث الإقلاع:\nExchange: {ex_id}\nTF: {TIMEFRAME}\nPairs: {', '.join([symbol_pretty(s) for s in syms[:10]])}{'' if len(syms)<=10 else f' …(+{len(syms)-10})'}",
                   reply_to_message_id=status_id)
+    # شغّل المهام الخلفية
     asyncio.create_task(runner())
     asyncio.create_task(poll_telegram_commands())
+    asyncio.create_task(keepalive_task())
 
 async def runner():
     holder=app.state.status_msg_id_holder
