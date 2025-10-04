@@ -1481,3 +1481,29 @@ async def runner():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+# ==========================================================
+# ✅ Keepalive route to prevent Render shutdown (for UptimeRobot)
+# ==========================================================
+try:
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    import threading
+
+    _app = FastAPI()
+
+    @_app.get("/")
+    @_app.head("/")
+    async def __root_health__():
+        return JSONResponse({
+            "status": "ok",
+            "message": "Trading bot active ✅",
+        })
+
+    def __run_keepalive__():
+        import uvicorn
+        uvicorn.run(_app, host="0.0.0.0", port=10000)
+
+    threading.Thread(target=__run_keepalive__, daemon=True).start()
+
+except Exception as e:
+    print(f"[KeepAlive] ⚠️ Warning: {e}")
