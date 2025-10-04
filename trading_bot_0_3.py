@@ -1,5 +1,4 @@
-# trading_bot_hard_1_8.py
-# كل الإعدادات داخل الكود (بدون Environment)
+# trading_bot_hard_1_9.py
 # المتطلبات: pip install ccxt fastapi uvicorn pandas requests
 
 import os, json, asyncio, time, io, csv, sqlite3, random
@@ -12,60 +11,70 @@ import ccxt
 from fastapi import FastAPI
 import uvicorn
 
-# ========================== [ عدّل هنا فقط ] ==========================
-TELEGRAM_TOKEN = "PASTE_YOUR_TOKEN_HERE"       # ← ضع توكن البوت
-CHAT_ID        = "PASTE_YOUR_CHAT_ID_HERE"     # ← ضع Chat ID (رقم)
+# ========================== [ ENV الضرورية ] ==========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID        = os.getenv("CHAT_ID", "").strip()     # اتركه نصًا (حتى لو رقم)
 
-# المنصّة/الأزواج/الإطار
-EXCHANGE_NAME = "okx"           # okx / kucoinfutures / bybit / bitget / gate / binance
-TIMEFRAME     = "5m"
-SYMBOLS_MODE  = "ALL"           # "ALL" = كل عقود السواب/اللينيير. أو "BTC/USDT,ETH/USDT"
+# يمكن (اختياريًا) تسمح بالتبديل من ENV، وإلا فالقيم أدناه تفوز
+EXCHANGE_ENV   = os.getenv("EXCHANGE", "").strip().lower()
+SYMBOLS_ENV    = os.getenv("SYMBOLS", "").strip()     # "ALL" أو قائمة "BTC/USDT,ETH/USDT"
+TIMEFRAME_ENV  = os.getenv("TIMEFRAME", "").strip()
 
-# حدود موثوقية/سيولة/تذبذب (مرنة)
-MIN_CONFIDENCE         = 55     # ارفعها لتقليل الإشارات (مثلاً 60–65)
-MIN_ATR_PCT            = 0.10   # الحد الأدنى لحركة ATR% (0.10 = 0.1%)
-MIN_AVG_VOL_USDT       = 50_000 # حد السيولة بالدولار على 30 شمعة
+# ========================== [ إعدادات داخل الكود ] ==========================
+# منصة/أزواج/إطار افتراضي (يتم تجاوزها لو ENV موجود)
+EXCHANGE_NAME = EXCHANGE_ENV or "okx"
+TIMEFRAME     = TIMEFRAME_ENV or "5m"
+SYMBOLS_MODE  = SYMBOLS_ENV or "ALL"   # "ALL" = كل عقود السواب؛ أو قائمة مفصولة بفواصل
 
-# RSI (مرن)
+# حدود موثوقية/سيولة/تذبذب
+MIN_CONFIDENCE         = 55
+MIN_ATR_PCT            = 0.10
+MIN_AVG_VOL_USDT       = 50_000
+
+# RSI
 RSI_LONG_MIN,  RSI_LONG_MAX  = 40, 72
 RSI_SHORT_MIN, RSI_SHORT_MAX = 28, 60
 
-# بولنجر: نطاق صارم + نطاق ألين
-BB_BANDWIDTH_MAX       = 0.045  # صارم
-BB_BANDWIDTH_MAX_SOFT  = 0.08   # ألين
-ALLOW_NO_SQUEEZE       = True   # اسمح بإشارة ضمن soft لو بقية الشروط قوية
+# بولنجر
+BB_BANDWIDTH_MAX       = 0.045
+BB_BANDWIDTH_MAX_SOFT  = 0.08
+ALLOW_NO_SQUEEZE       = True
 
-# فلتر الترند (EMA50 مقابل EMA200)
-REQUIRE_TREND          = False  # True = إشارات باتجاه الترند فقط
+# فلتر الترند (EMA50/EMA200)
+REQUIRE_TREND          = False
 
 # أهداف/وقف
-TP_PCTS                = [0.25, 0.5, 1.0, 1.5]  # بالنسب المئوية
+TP_PCTS                = [0.25, 0.5, 1.0, 1.5]
 ATR_SL_MULT            = 1.5
 SL_LOOKBACK            = 12
 MIN_SL_PCT, MAX_SL_PCT = 0.30, 3.00
 
-# تبريد ومنع سبام
-SCAN_INTERVAL                 = 60     # ثانية بين الدورات
-MIN_SIGNAL_GAP_SEC            = 6      # فاصلة زمنية دنيا بين الرسائل
-MAX_ALERTS_PER_CYCLE          = 6      # أقصى إشارات لكل دورة
-COOLDOWN_PER_SYMBOL_CANDLES   = 8      # تبريد لكل رمز بالشموع المغلقة
-MAX_SYMBOLS                   = 120    # حد أقصى للأزواج (0 = بدون حد)
+# تبريد/سبام
+SCAN_INTERVAL                 = 60
+MIN_SIGNAL_GAP_SEC            = 6
+MAX_ALERTS_PER_CYCLE          = 6
+COOLDOWN_PER_SYMBOL_CANDLES   = 8
+MAX_SYMBOLS                   = 120
 
-# ملخّص "لا توجد إشارات" (افتراضياً معطّل)
-NO_SIG_EVERY_N_CYCLES         = 0      # 0 = تعطيل
-NO_SIG_EVERY_MINUTES          = 0      # 0 = تعطيل
+# ملخّص "لا توجد إشارات"
+NO_SIG_EVERY_N_CYCLES         = 0
+NO_SIG_EVERY_MINUTES          = 0
 
 # keepalive (اختياري)
-KEEPALIVE_URL      = ""               # مثال: "https://your-service.onrender.com/"
-KEEPALIVE_INTERVAL = 240              # ثواني
+KEEPALIVE_URL      = ""         # مثال: "https://your-app.onrender.com/"
+KEEPALIVE_INTERVAL = 240
 
 # واجهة/نسخة
 BUILD_UTC     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-APP_VERSION   = f"1.8 ({BUILD_UTC})"
+APP_VERSION   = f"1.9 ({BUILD_UTC})"
 POLL_COMMANDS = True
-POLL_INTERVAL = 10   # فحص أوامر التلغرام كل n ثانية
-# ======================== [ لا تعدّل تحت غالباً ] ========================
+POLL_INTERVAL = 10
+
+# ======================== [ لا تعدّل تحت غالبًا ] ========================
 LOG_DB_PATH = "bot_stats.db"
+
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    raise SystemExit("ENV مفقودة: TELEGRAM_TOKEN و CHAT_ID مطلوبة (Render → Environment).")
 
 TG_API   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 SEND_URL = TG_API + "/sendMessage"
@@ -93,11 +102,14 @@ def send_telegram(text: str, reply_to_message_id: Optional[int]=None,
     if reply_markup: data["reply_markup"] = reply_markup
     try:
         r = requests.post(SEND_URL, data=data, timeout=25).json()
-        if not r.get("ok"): print("Telegram error:", r); return None
+        if not r.get("ok"):
+            print("Telegram error:", r)
+            return None
         _last_send_ts = time.time()
         return r["result"]["message_id"]
     except Exception as e:
-        print("Telegram send error:", e); return None
+        print("Telegram send error:", e)
+        return None
 
 def send_document(filename: str, file_bytes: bytes, caption: str="") -> bool:
     try:
@@ -182,7 +194,7 @@ def parse_symbols(ex, val:str)->List[str]:
         return list_all_futures_symbols(ex)
     syms=[s.strip() for s in (val or "").split(",") if s.strip()]
     syms=normalize_symbols_for_exchange(ex, syms)
-    if MAX_SYMBOLS>0 and MAX_SYMBOLS>0: syms=syms[:MAX_SYMBOLS]
+    if MAX_SYMBOLS>0: syms=syms[:MAX_SYMBOLS]
     return syms
 
 # ================== جلب البيانات ==================
@@ -194,7 +206,8 @@ async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
         ohlcv=await asyncio.to_thread(ex.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, params=params)
         if not ohlcv or len(ohlcv)<60: return None
         df=pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["ts"]=pd.to_datetime(df["ts"], unit="ms", utc=True); df.set_index("ts", inplace=True)
+        df["ts"]=pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df.set_index("ts", inplace=True)
         return df
     except Exception as e:
         return f"خطأ المنصة: {ex.id} {type(e).__name__} {str(e)[:200]}"
@@ -245,7 +258,7 @@ def db_insert_error(ts,ex,sym,msg):
     con=db_conn(); con.execute("INSERT INTO errors(ts,exchange,symbol,message) VALUES(?,?,?,?)",
                                (ts,ex,sym,msg)); con.commit(); con.close()
 
-# ================== الاستراتيجية (مرنة) ==================
+# ================== الاستراتيجية ==================
 def compute_confidence(df,side,bb_bw_now,c_prev,c_now,band_now,macd_now,macd_sig,r14,atr_now)->int:
     tight = clamp((BB_BANDWIDTH_MAX - bb_bw_now)/max(BB_BANDWIDTH_MAX,1e-9), 0, 1)
     breakout = clamp(((c_now - band_now) if side=="LONG" else (band_now - c_now))/max(atr_now,1e-9), 0, 1)
@@ -281,7 +294,7 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     squeeze_soft   = bw_now <= BB_BANDWIDTH_MAX_SOFT
     squeeze_ok     = squeeze_strict or (ALLOW_NO_SQUEEZE and squeeze_soft)
 
-    # سيولة وحركة دنيا
+    # سيولة/حركة
     try: avg_usdt=float((df["volume"]*c).tail(30).mean())
     except Exception: avg_usdt=0.0
     if (atr_pct < MIN_ATR_PCT) or (avg_usdt < MIN_AVG_VOL_USDT):
@@ -298,8 +311,8 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     long_price_ok  = crossed_up   or ((c_now > up_now) and (c_prev > ma20_prev))
     short_price_ok = crossed_down or ((c_now < dn_now) and (c_prev < ma20_prev))
 
-    long_momentum  = (macd_now > sig_now) or (c_now > e50)
-    short_momentum = (macd_now < sig_now) or (c_now < e50)
+    long_momentum  = (macd_now > macd_sig) or (c_now > ema50.iloc[i1])
+    short_momentum = (macd_now < macd_sig) or (c_now < ema50.iloc[i1])
 
     rsi_long_ok  = (RSI_LONG_MIN  < r14 < RSI_LONG_MAX)
     rsi_short_ok = (RSI_SHORT_MIN < r14 < RSI_SHORT_MAX)
@@ -320,7 +333,7 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     band_now = up_now if side=="LONG" else dn_now
     conf = compute_confidence(df, side, bw_now, c_prev, c_now, band_now, macd_now, sig_now, r14, atr_now)
 
-    # SL واقعي بحدود دنيا/عليا
+    # SL واقعي ضمن حدود دنيا/عليا
     recent_lows  = float(l.tail(SL_LOOKBACK).min())
     recent_highs = float(h.tail(SL_LOOKBACK).max())
     entry=c_now; atr_dist=ATR_SL_MULT*max(atr_now,1e-12)
@@ -564,8 +577,6 @@ def attempt_build():
 
 @app.on_event("startup")
 async def _startup():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise SystemExit("ضع TELEGRAM_TOKEN و CHAT_ID في أعلى الملف.")
     db_init()
     send_telegram(
         f"> توصيات تداول Ai v{APP_VERSION}:\n"
