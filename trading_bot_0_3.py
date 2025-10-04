@@ -1,7 +1,7 @@
-# trading_bot_hard_1_9.py
+# trading_bot_hard_1_9_1.py
 # المتطلبات: pip install ccxt fastapi uvicorn pandas requests
 
-import os, json, asyncio, time, io, csv, sqlite3, random
+import os, json, asyncio, time, io, csv, sqlite3, random, math, traceback
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -11,70 +11,58 @@ import ccxt
 from fastapi import FastAPI
 import uvicorn
 
-# ========================== [ ENV الضرورية ] ==========================
+# ========================== [ ENV ] ==========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID        = os.getenv("CHAT_ID", "").strip()     # اتركه نصًا (حتى لو رقم)
+CHAT_ID        = os.getenv("CHAT_ID", "").strip()
 
-# يمكن (اختياريًا) تسمح بالتبديل من ENV، وإلا فالقيم أدناه تفوز
 EXCHANGE_ENV   = os.getenv("EXCHANGE", "").strip().lower()
-SYMBOLS_ENV    = os.getenv("SYMBOLS", "").strip()     # "ALL" أو قائمة "BTC/USDT,ETH/USDT"
-TIMEFRAME_ENV  = os.getenv("TIMEFRAME", "").strip()
+SYMBOLS_ENV    = os.getenv("SYMBOLS", "").strip()     # "ALL" أو قائمة
+TIMEFRAME_ENV  = os.getenv("TIMEFRAME", "").strip()   # مثال 5m
 
-# ========================== [ إعدادات داخل الكود ] ==========================
-# منصة/أزواج/إطار افتراضي (يتم تجاوزها لو ENV موجود)
+# ========================== [ إعدادات ] ==========================
 EXCHANGE_NAME = EXCHANGE_ENV or "okx"
 TIMEFRAME     = TIMEFRAME_ENV or "5m"
-SYMBOLS_MODE  = SYMBOLS_ENV or "ALL"   # "ALL" = كل عقود السواب؛ أو قائمة مفصولة بفواصل
+SYMBOLS_MODE  = SYMBOLS_ENV or "ALL"   # "ALL" أو "BTC/USDT,ETH/USDT"
 
-# حدود موثوقية/سيولة/تذبذب
 MIN_CONFIDENCE         = 55
 MIN_ATR_PCT            = 0.10
 MIN_AVG_VOL_USDT       = 50_000
 
-# RSI
 RSI_LONG_MIN,  RSI_LONG_MAX  = 40, 72
 RSI_SHORT_MIN, RSI_SHORT_MAX = 28, 60
 
-# بولنجر
 BB_BANDWIDTH_MAX       = 0.045
 BB_BANDWIDTH_MAX_SOFT  = 0.08
 ALLOW_NO_SQUEEZE       = True
 
-# فلتر الترند (EMA50/EMA200)
 REQUIRE_TREND          = False
 
-# أهداف/وقف
 TP_PCTS                = [0.25, 0.5, 1.0, 1.5]
 ATR_SL_MULT            = 1.5
 SL_LOOKBACK            = 12
 MIN_SL_PCT, MAX_SL_PCT = 0.30, 3.00
 
-# تبريد/سبام
 SCAN_INTERVAL                 = 60
 MIN_SIGNAL_GAP_SEC            = 6
 MAX_ALERTS_PER_CYCLE          = 6
 COOLDOWN_PER_SYMBOL_CANDLES   = 8
 MAX_SYMBOLS                   = 120
 
-# ملخّص "لا توجد إشارات"
 NO_SIG_EVERY_N_CYCLES         = 0
 NO_SIG_EVERY_MINUTES          = 0
 
-# keepalive (اختياري)
-KEEPALIVE_URL      = ""         # مثال: "https://your-app.onrender.com/"
+KEEPALIVE_URL      = ""
 KEEPALIVE_INTERVAL = 240
 
-# واجهة/نسخة
 BUILD_UTC     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-APP_VERSION   = f"1.9 ({BUILD_UTC})"
+APP_VERSION   = f"1.9.1 ({BUILD_UTC})"
 POLL_COMMANDS = True
 POLL_INTERVAL = 10
 
-# ======================== [ لا تعدّل تحت غالبًا ] ========================
 LOG_DB_PATH = "bot_stats.db"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise SystemExit("ENV مفقودة: TELEGRAM_TOKEN و CHAT_ID مطلوبة (Render → Environment).")
+    raise SystemExit("ENV مفقودة: TELEGRAM_TOKEN و CHAT_ID مطلوبة.")
 
 TG_API   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 SEND_URL = TG_API + "/sendMessage"
@@ -83,6 +71,11 @@ TG_GET_UPDATES    = TG_API + "/getUpdates"
 TG_DELETE_WEBHOOK = TG_API + "/deleteWebhook"
 
 _last_send_ts = 0
+
+# مانع سبام أخطاء اللوب
+_error_bucket = []
+_error_last_flush = 0
+ERROR_FLUSH_EVERY = 300  # ثانية
 
 def _reply_kb(rows: List[List[str]]) -> str:
     return json.dumps({
@@ -141,7 +134,8 @@ def macd(s: pd.Series, f=12, sl=26, sig=9)->Tuple[pd.Series,pd.Series]:
     ef, es = ema(s,f), ema(s,sl); line=ef-es; return line, ema(line,sig)
 def bollinger(s: pd.Series, n=20, k=2.0):
     ma=s.rolling(n).mean(); sd=s.rolling(n).std(ddof=0)
-    up=ma+k*sd; dn=ma-k*sd; bw=(up-dn)/ma; return ma, up, dn, bw
+    up=ma+k*sd; dn=ma-k*sd; bw=(up-dn)/ma.replace(0, 1e-12)
+    return ma, up, dn, bw
 def atr(df: pd.DataFrame, n=14):
     h,l,c = df["high"], df["low"], df["close"]
     tr=pd.concat([(h-l).abs(),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
@@ -215,7 +209,8 @@ async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
 async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
     try:
         t=await asyncio.to_thread(ex.fetch_ticker, symbol)
-        return float(t.get("last") or t.get("close") or t.get("info",{}).get("lastPrice"))
+        v=t.get("last") or t.get("close") or t.get("info",{}).get("lastPrice")
+        return float(v) if v is not None else None
     except Exception: return None
 
 # ================== DB/Helpers ==================
@@ -258,9 +253,15 @@ def db_insert_error(ts,ex,sym,msg):
     con=db_conn(); con.execute("INSERT INTO errors(ts,exchange,symbol,message) VALUES(?,?,?,?)",
                                (ts,ex,sym,msg)); con.commit(); con.close()
 
-# ================== الاستراتيجية ==================
-def compute_confidence(df,side,bb_bw_now,c_prev,c_now,band_now,macd_now,macd_sig,r14,atr_now)->int:
-    tight = clamp((BB_BANDWIDTH_MAX - bb_bw_now)/max(BB_BANDWIDTH_MAX,1e-9), 0, 1)
+# ================== الاستراتيجية (مُحكمة الأنواع) ==================
+def _f(x)->float:
+    v=float(x)
+    if math.isnan(v) or math.isinf(v): raise ValueError("nan/inf")
+    return v
+
+def compute_confidence(side:str,bw_now:float,c_prev:float,c_now:float,band_now:float,
+                       macd_now:float,macd_sig:float,r14:float,atr_now:float)->int:
+    tight = clamp((BB_BANDWIDTH_MAX - bw_now)/max(BB_BANDWIDTH_MAX,1e-9), 0, 1)
     breakout = clamp(((c_now - band_now) if side=="LONG" else (band_now - c_now))/max(atr_now,1e-9), 0, 1)
     mom = clamp(abs(macd_now - macd_sig)/max(atr_now,1e-9), 0, 1)
     rsi_target = 60 if side=="LONG" else 40
@@ -278,47 +279,51 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
 
     i2,i1=-3,-2
     try:
-        c_prev, c_now = float(c.iloc[i2]), float(c.iloc[i1])
-        up_prev, up_now = float(bb_up.iloc[i2]), float(bb_up.iloc[i1])
-        dn_prev, dn_now = float(bb_dn.iloc[i2]), float(bb_dn.iloc[i1])
-        bw_now = float(bb_bw.iloc[i1])
-        macd_now = float(macd_line.iloc[i1]); sig_now = float(macd_sig.iloc[i1])
-        r14 = float(r.iloc[i1]); atr_now = float(atr14.iloc[i1])
-        e50=float(ema50.iloc[i1]); e200=float(ema200.iloc[i1])
-        ma20_prev=float(ma20.iloc[i2])
+        # تحويل صارم إلى float — يمنع Series في الشروط
+        c_prev=_f(c.iloc[i2]); c_now=_f(c.iloc[i1])
+        up_prev=_f(bb_up.iloc[i2]); up_now=_f(bb_up.iloc[i1])
+        dn_prev=_f(bb_dn.iloc[i2]); dn_now=_f(bb_dn.iloc[i1])
+        bw_now=_f(bb_bw.iloc[i1])
+        macd_now=_f(macd_line.iloc[i1]); sig_now=_f(macd_sig.iloc[i1])
+        r14=_f(r.iloc[i1]); atr_now=_f(atr14.iloc[i1])
+        e50=_f(ema50.iloc[i1]); e200=_f(ema200.iloc[i1])
+        ma20_prev=_f(ma20.iloc[i2])
     except Exception:
-        return None, {"index_error":True}
+        return None, {"index_or_nan": True}
 
     atr_pct = 100*atr_now/max(c_now,1e-9)
+    try:
+        avg_usdt=float((df["volume"]*c).tail(30).mean())
+        if math.isnan(avg_usdt) or math.isinf(avg_usdt): avg_usdt = 0.0
+    except Exception:
+        avg_usdt=0.0
+
+    if (atr_pct < MIN_ATR_PCT) or (avg_usdt < MIN_AVG_VOL_USDT):
+        return None, {"atr_pct":round(atr_pct,3), "avg_vol_usdt":int(avg_usdt), "note":"low_vol_or_range"}
+
     squeeze_strict = bw_now <= BB_BANDWIDTH_MAX
     squeeze_soft   = bw_now <= BB_BANDWIDTH_MAX_SOFT
-    squeeze_ok     = squeeze_strict or (ALLOW_NO_SQUEEZE and squeeze_soft)
-
-    # سيولة/حركة
-    try: avg_usdt=float((df["volume"]*c).tail(30).mean())
-    except Exception: avg_usdt=0.0
-    if (atr_pct < MIN_ATR_PCT) or (avg_usdt < MIN_AVG_VOL_USDT):
-        return None, {"atr_pct":round(atr_pct,3), "avg_vol_usdt":int(avg_usdt), "squeeze":squeeze_ok}
+    squeeze_ok     = bool(squeeze_strict or (ALLOW_NO_SQUEEZE and squeeze_soft))
 
     trend_up = e50>e200
     trend_down = e50<e200
     trend_ok_long = (not REQUIRE_TREND) or trend_up
     trend_ok_short= (not REQUIRE_TREND) or trend_down
 
-    crossed_up   = (c_prev <= up_prev) and (c_now > up_now)
-    crossed_down = (c_prev >= dn_prev) and (c_now < dn_now)
+    crossed_up   = bool((c_prev <= up_prev) and (c_now > up_now))
+    crossed_down = bool((c_prev >= dn_prev) and (c_now < dn_now))
 
-    long_price_ok  = crossed_up   or ((c_now > up_now) and (c_prev > ma20_prev))
-    short_price_ok = crossed_down or ((c_now < dn_now) and (c_prev < ma20_prev))
+    long_price_ok  = bool(crossed_up   or ((c_now > up_now) and (c_prev > ma20_prev)))
+    short_price_ok = bool(crossed_down or ((c_now < dn_now) and (c_prev < ma20_prev)))
 
-    long_momentum  = (macd_now > macd_sig) or (c_now > ema50.iloc[i1])
-    short_momentum = (macd_now < macd_sig) or (c_now < ema50.iloc[i1])
+    long_momentum  = bool((macd_now > sig_now) or (c_now > e50))
+    short_momentum = bool((macd_now < sig_now) or (c_now < e50))
 
-    rsi_long_ok  = (RSI_LONG_MIN  < r14 < RSI_LONG_MAX)
-    rsi_short_ok = (RSI_SHORT_MIN < r14 < RSI_SHORT_MAX)
+    rsi_long_ok  = bool(RSI_LONG_MIN  < r14 < RSI_LONG_MAX)
+    rsi_short_ok = bool(RSI_SHORT_MIN < r14 < RSI_SHORT_MAX)
 
-    long_ok  = squeeze_ok and long_price_ok  and long_momentum  and rsi_long_ok  and trend_ok_long
-    short_ok = squeeze_ok and short_price_ok and short_momentum and rsi_short_ok and trend_ok_short
+    long_ok  = bool(squeeze_ok and long_price_ok  and long_momentum  and rsi_long_ok  and trend_ok_long)
+    short_ok = bool(squeeze_ok and short_price_ok and short_momentum and rsi_short_ok and trend_ok_short)
 
     if not (long_ok or short_ok):
         return None, {
@@ -331,9 +336,8 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
 
     side = "LONG" if long_ok else "SHORT"
     band_now = up_now if side=="LONG" else dn_now
-    conf = compute_confidence(df, side, bw_now, c_prev, c_now, band_now, macd_now, sig_now, r14, atr_now)
+    conf = compute_confidence(side,bw_now,c_prev,c_now,band_now,macd_now,sig_now,r14,atr_now)
 
-    # SL واقعي ضمن حدود دنيا/عليا
     recent_lows  = float(l.tail(SL_LOOKBACK).min())
     recent_highs = float(h.tail(SL_LOOKBACK).max())
     entry=c_now; atr_dist=ATR_SL_MULT*max(atr_now,1e-12)
@@ -389,7 +393,13 @@ async def fetch_and_signal(ex, symbol:str):
     if closed_idx < st.get("cooldown_until_idx",-999999): return
     if symbol in open_trades: return
 
-    sig, reasons = smart_signal(out)
+    try:
+        sig, reasons = smart_signal(out)
+    except Exception as e:
+        # لا ترمي الخطأ — خزّنه وأكمل
+        _error_bucket.append(f"{symbol}: {type(e).__name__} {str(e)}")
+        return
+
     if not sig:
         db_insert_nosignal(unix_now(),ex.id,symbol,reasons or {"note":"no_setup"}); return
     if sig["confidence"] < MIN_CONFIDENCE:
@@ -433,7 +443,7 @@ async def check_open_trades(ex):
             if all(pos["hit"]): del open_trades[sym]
 
 async def scan_once(ex, symbols:List[str]):
-    global _last_cycle_alerts
+    global _last_cycle_alerts, _error_last_flush, _error_bucket
     _last_cycle_alerts = 0
     await check_open_trades(ex)
     if not symbols: return
@@ -442,6 +452,14 @@ async def scan_once(ex, symbols:List[str]):
     async def worker(s):
         async with sem: await fetch_and_signal(ex,s)
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
+
+    # flush errors (ملخص)
+    now=time.time()
+    if _error_bucket and (now - _error_last_flush >= ERROR_FLUSH_EVERY):
+        sample = "\n".join(_error_bucket[:8])
+        send_telegram(f"⚠️ ملخص أخطاء الإشارات ({len(_error_bucket)}):\n{sample}")
+        _error_bucket.clear()
+        _error_last_flush = now
 
 # ================== تقارير/أوامر ==================
 def db_text_stats(days:int=1)->str:
@@ -609,7 +627,8 @@ async def runner():
             app.state.cycle_count += 1
             await maybe_send_no_signal_summary()
         except Exception as e:
-            send_telegram(f"⚠️ Loop error: {type(e).__name__} {str(e)[:160]}")
+            # اختصر الخطأ بدل ما نغرق رسائل
+            _error_bucket.append(f"Loop: {type(e).__name__} {str(e)}\n{traceback.format_exc().splitlines()[-1]}")
         await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__=="__main__":
