@@ -1,11 +1,14 @@
-# trading_bot_0_6.py
-# إصلاح Bybit: load_markets مقيّد لـ linear swap + backoff
-# رسالة التشغيل مرة واحدة فقط، وباقي الرسائل Replies
-# يدعم AUTO_FUTURES + تطبيع :USDT لبايبت + باراميترات OHLCV حسب المنصة
+# trading_bot_0_7.py
+# ميزات:
+# - Failover تلقائي بين عدة منصات إذا فشل load_markets (403/451/WAF)
+# - تقييد Bybit على linear swap + تطبيع الرموز :USDT
+# - عدم إرسال JSON فاضي؛ ولو مافيه رموز، يرسل تنبيه ذكي ويحاول إعادة التحميل دورياً
+# - رسالة التشغيل تُرسل مرة واحدة، وكل الرسائل لاحقًا Replies عليها
+# - AUTO_FUTURES + MAX_SYMBOLS + بارامترات OHLCV الصحيحة لكل منصة
+# - تقليل التوازي لتفادي RateLimit
 
 import os, json, asyncio, traceback, time
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone
 
 import requests
 import ccxt
@@ -14,11 +17,11 @@ import pandas as pd
 from fastapi import FastAPI
 import uvicorn
 
-# ========== إعدادات عامة ==========
+# ===================== الإعدادات =====================
 EXCHANGE_NAME = os.getenv("EXCHANGE", "bybit").lower()
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-SYMBOLS_ENV   = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT")
-MAX_SYMBOLS   = int(os.getenv("MAX_SYMBOLS", "0"))
+SYMBOLS_ENV   = os.getenv("SYMBOLS", "AUTO_FUTURES")
+MAX_SYMBOLS   = int(os.getenv("MAX_SYMBOLS", "50"))   # جرّب 50 كبداية
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 OHLCV_LIMIT   = int(os.getenv("OHLCV_LIMIT", "300"))
 
@@ -32,7 +35,7 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# ========== Telegram ==========
+# ===================== Telegram =====================
 def send_telegram(text: str, reply_to_message_id: Optional[int] = None) -> Optional[int]:
     try:
         resp = requests.post(
@@ -54,18 +57,19 @@ def send_telegram(text: str, reply_to_message_id: Optional[int] = None) -> Optio
         print(f"Telegram send error: {type(e).__name__}: {e}")
         return None
 
-# ========== CCXT: إنشاء المنصة ==========
-def make_exchange(name: str):
-    klass = {
-        "bybit": ccxt.bybit,
-        "okx": ccxt.okx,
-        "binance": ccxt.binance,
-        "kucoinfutures": ccxt.kucoinfutures,
-        "krakenfutures": ccxt.krakenfutures,
-        "bitget": ccxt.bitget,
-        "gate": ccxt.gate,
-    }.get(name, ccxt.bybit)
+# ===================== CCXT / Exchanges =====================
+EXCHANGE_CLASS_MAP = {
+    "bybit": ccxt.bybit,
+    "okx": ccxt.okx,
+    "kucoinfutures": ccxt.kucoinfutures,
+    "bitget": ccxt.bitget,
+    "gate": ccxt.gate,
+    "binance": ccxt.binance,
+    "krakenfutures": ccxt.krakenfutures,
+}
 
+def make_exchange(name: str):
+    klass = EXCHANGE_CLASS_MAP.get(name, ccxt.bybit)
     cfg = {
         "enableRateLimit": True,
         "timeout": 20000,
@@ -80,26 +84,42 @@ def make_exchange(name: str):
 
 def load_markets_linear_only(exchange) -> None:
     """
-    يحمّل الماركتس مقيدة للفيوتشرز/سواب linear فقط، مع backoff.
-    لو فشل بسبب 403/451 على Bybit، يرمي الاستثناء كي تغيّر المنصة.
+    يحاول تحميل الأسواق مقيدة للفيوتشرز/سواب (linear) مع backoff قصير.
+    يتوقف مبكرًا لو الخطأ 403/451/WAF.
     """
     backoffs = [1.5, 3.0, 6.0]
     last_exc = None
     for i, wait in enumerate(backoffs, start=1):
         try:
-            # تمرير تلميحات للـ linear swap. قد تتجاهلها بعض المنصات، لكن Bybit يفهم category=linear.
             exchange.load_markets(reload=True, params={"category": "linear", "type": "swap"})
             return
         except Exception as e:
             last_exc = e
             emsg = str(e)
-            print(f"[load_markets attempt {i}] {type(e).__name__}: {emsg[:200]}")
+            print(f"[load_markets attempt {i}] {type(e).__name__}: {emsg[:220]}")
             if "403" in emsg or "451" in emsg or "Forbidden" in emsg:
                 break
             time.sleep(wait)
     raise last_exc
 
-# ========== مؤشرات ==========
+def try_build_exchange_with_failover(primary: str, candidates: List[str]) -> Tuple[ccxt.Exchange, str]:
+    order = [primary] + [c for c in candidates if c != primary]
+    last_err = None
+    for name in order:
+        try:
+            ex = make_exchange(name)
+            load_markets_linear_only(ex)
+            print(f"[failover] using exchange: {name}")
+            return ex, name
+        except Exception as e:
+            last_err = e
+            print(f"[failover] {name} failed: {type(e).__name__}: {str(e)[:220]}")
+            # جرّب التالي
+    if last_err:
+        raise last_err
+    raise Exception("No exchanges available")
+
+# ===================== مؤشرات =====================
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
@@ -137,7 +157,7 @@ def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> pd.Seri
         prev = st.iloc[i]
     return st
 
-# ========== منطق الإشارة ==========
+# ===================== منطق الإشارة =====================
 def build_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     reasons = {}
     if df is None or len(df) < 60:
@@ -180,7 +200,7 @@ def build_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     })
     return None, reasons
 
-# ========== رموز الفيوتشرز ==========
+# ===================== رموز الفيوتشرز =====================
 def normalize_symbols_for_exchange(exchange, symbols: List[str]) -> List[str]:
     if exchange.id == "bybit":
         out = []
@@ -212,7 +232,7 @@ def parse_symbols_from_env(exchange, env_value: str) -> List[str]:
         syms = syms[:MAX_SYMBOLS]
     return syms
 
-# ========== جلب البيانات ==========
+# ===================== جلب البيانات =====================
 async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
     try:
         params = {}
@@ -220,6 +240,7 @@ async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
             params = {"category": "linear"}
         elif exchange.id == "okx":
             params = {"instType": "SWAP"}
+        # باقي المنصات غالبًا تعمل بدون params إضافية
         ohlcv = await asyncio.to_thread(
             exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, params=params
         )
@@ -230,7 +251,7 @@ async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
         df.set_index("ts", inplace=True)
         return df
     except Exception as e:
-        return f"خطأ المنصة: {exchange.id} {type(e).__name__} {str(e)[:180]}"
+        return f"خطأ المنصة: {exchange.id} {type(e).__name__} {str(e)[:200]}"
 
 async def fetch_ticker_price(exchange, symbol: str) -> Optional[float]:
     try:
@@ -239,7 +260,7 @@ async def fetch_ticker_price(exchange, symbol: str) -> Optional[float]:
     except Exception:
         return None
 
-# ========== حالة الصفقات ==========
+# ===================== حالة الصفقات =====================
 open_trades: Dict[str, Dict] = {}  # symbol -> {side, entry, tp, sl, msg_id}
 
 def crossed(side: str, price: Optional[float], tp: float, sl: float) -> Optional[str]:
@@ -253,13 +274,35 @@ def crossed(side: str, price: Optional[float], tp: float, sl: float) -> Optional
         if price >= sl: return "SL"
     return None
 
-# ========== دورة المسح ==========
+# ===================== FastAPI =====================
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "exchange": getattr(app.state, "exchange_id", EXCHANGE_NAME),
+        "timeframe": TIMEFRAME,
+        "symbols_mode": SYMBOLS_ENV,
+        "max_symbols": MAX_SYMBOLS,
+        "scan_interval": SCAN_INTERVAL,
+        "open_trades": len(open_trades),
+        "symbols_count": len(getattr(app.state, "symbols", [])),
+        "failover_used": getattr(app.state, "exchange_id", EXCHANGE_NAME),
+    }
+
+# ===================== المسح =====================
 async def scan_once(exchange, symbols: List[str], status_msg_id_holder: Dict[str, Optional[int]]):
+    # لو مافيه رموز، لا نرسل JSON فاضي؛ نترك runner يحاول إعادة التحميل
+    if not symbols:
+        # أرسل تذكير ذكي مرة كل عدة دورات فقط (يُدار في runner)
+        return
+
     no_signal_reasons: Dict[str, Dict] = {}
     new_signals: Dict[str, Dict] = {}
     errors: Dict[str, str] = {}
 
-    # 1) تحقق TP/SL
+    # تحقق TP/SL
     for sym, pos in list(open_trades.items()):
         price = await fetch_ticker_price(exchange, sym)
         flag = crossed(pos["side"], price, pos["tp"], pos["sl"])
@@ -275,7 +318,7 @@ async def scan_once(exchange, symbols: List[str], status_msg_id_holder: Dict[str
             send_telegram(txt, reply_to_message_id=pos.get("msg_id"))
             del open_trades[sym]
 
-    # 2) إشارات جديدة
+    # إشارات جديدة
     sem = asyncio.Semaphore(2)  # تقليل التوازي
 
     async def process_symbol(symbol: str):
@@ -297,7 +340,6 @@ async def scan_once(exchange, symbols: List[str], status_msg_id_holder: Dict[str
 
     status_id = status_msg_id_holder.get("id")
 
-    # 3) إرسال النتائج
     if new_signals:
         for sym, s in new_signals.items():
             txt = (
@@ -322,65 +364,95 @@ async def scan_once(exchange, symbols: List[str], status_msg_id_holder: Dict[str
             for k, v in list(errors.items())[:10]:
                 bundle[k] = v[:200]
         send_telegram(
-            f"> توصيات تداول Ai:\nℹ️ لا توجد إشارات حاليًا – الأسباب\n{json.dumps(bundle, ensure_ascii=False, indent=2)}",
+            f"> توصيات تداول Ai:\nℹ️ لا توجد إشارات حاليًا – الأسباب\n{json.dumps(bundle, ensure_ascii=False, indent=2) if bundle else '—'}",
             reply_to_message_id=status_id
         )
 
-# ========== FastAPI & Runner ==========
-app = FastAPI()
-
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "exchange": getattr(app.state, "exchange_id", EXCHANGE_NAME),
-        "timeframe": TIMEFRAME,
-        "symbols_mode": SYMBOLS_ENV,
-        "max_symbols": MAX_SYMBOLS,
-        "scan_interval": SCAN_INTERVAL,
-        "open_trades": len(open_trades),
-    }
+# ===================== Runner + Startup =====================
+async def attempt_reload_symbols(app_state) -> None:
+    """
+    يحاول بناء منصة مع Failover ثم تحميل الأسواق واستخراج الرموز.
+    يحدّث app.state عند النجاح.
+    """
+    fallbacks = ["okx", "kucoinfutures", "bitget", "gate", "binance"]
+    try:
+        ex, used = try_build_exchange_with_failover(EXCHANGE_NAME, fallbacks)
+        syms = parse_symbols_from_env(ex, SYMBOLS_ENV)
+        app_state.exchange = ex
+        app_state.exchange_id = used
+        app_state.symbols = syms
+        print(f"[reload] success on {used}, symbols={len(syms)}")
+    except Exception as e:
+        # أبقِ الحالة كما هي؛ المحاولة القادمة لاحقاً
+        print(f"[reload] failed: {type(e).__name__}: {str(e)[:220]}")
 
 async def runner():
-    exchange = app.state.exchange
-    symbols = app.state.symbols
     holder = app.state.status_msg_id_holder
+    empty_symbols_notify_every = 5   # كل 5 دورات
+    empty_counter = 0
+
     while True:
         try:
-            await scan_once(exchange, symbols, holder)
+            ex = app.state.exchange
+            syms = app.state.symbols
+
+            if not syms:
+                empty_counter += 1
+                # أرسل تنبيه كل N دورات فقط
+                if empty_counter % empty_symbols_notify_every == 1:
+                    send_telegram(
+                        "> ملاحظة: لا توجد رموز مُحمّلة بعد.\n"
+                        "سأعيد محاولة تحميل الأسواق/المنصة تلقائيًا (failover) خلال الدورات القادمة.",
+                        reply_to_message_id=holder.get("id")
+                    )
+                # جرّب إعادة التحميل
+                await attempt_reload_symbols(app.state)
+            else:
+                # عند وجود رموز، نفّذ دورة المسح
+                await scan_once(ex, syms, holder)
+
         except Exception as e:
             err = f"Loop error: {type(e).__name__} {e}\n{traceback.format_exc()}"
             print(err)
             send_telegram(f"⚠️ Loop error:\n{err[:3500]}", reply_to_message_id=holder.get("id"))
+
         await asyncio.sleep(SCAN_INTERVAL)
+
+app = FastAPI()
 
 @app.on_event("startup")
 async def _startup():
-    exchange = make_exchange(EXCHANGE_NAME)
-    # حمّل الماركتس للفيوتشرز فقط (linear)
-    symbols: List[str] = []
-    try:
-        load_markets_linear_only(exchange)
-        symbols = parse_symbols_from_env(exchange, SYMBOLS_ENV)
-    except Exception as e:
-        msg = (f"⚠️ فشل load_markets على {EXCHANGE_NAME}: {type(e).__name__} {str(e)[:180]}\n"
-               f"إذا ظهر 403/451 جرّب تغيير EXCHANGE إلى okx أو kucoinfutures أو فعّل بروكسي.")
-        print(msg)
-        send_telegram(msg)
-        # سنبقي الخدمة حيّة لتبديل المنصة من لوحة Render دون إعادة نشر.
-
+    # إعداد رسالة التشغيل (نرسلها مهما كان)
     head = (f"> توصيات تداول Ai:\n"
             f"✅ البوت اشتغل\n"
-            f"Exchange: {exchange.id}\nTF: {TIMEFRAME}\n"
-            f"Pairs: {', '.join(symbols[:10])}" + ("" if len(symbols) <= 10 else f" …(+{len(symbols)-10})"))
+            f"Exchange: (initializing)\nTF: {TIMEFRAME}\n"
+            f"Pairs: (loading…)")
     status_id = send_telegram(head)
 
-    app.state.exchange = exchange
-    app.state.exchange_id = exchange.id
-    app.state.symbols = symbols
+    # جهّز حالة التطبيق
     app.state.status_msg_id_holder = {"id": status_id}
+    app.state.exchange = make_exchange(EXCHANGE_NAME)  # placeholder
+    app.state.exchange_id = EXCHANGE_NAME
+    app.state.symbols = []
 
+    # أول محاولة تحميل + Failover
+    await attempt_reload_symbols(app.state)
+
+    # بعد أول محاولة، عدّل الرسالة الرأسية بمعلومة أوضح (Reply تحديثي صغير)
+    ex_id = getattr(app.state, "exchange_id", EXCHANGE_NAME)
+    syms = getattr(app.state, "symbols", [])
+    upd = (f"> تحديث الإقلاع:\n"
+           f"Exchange: {ex_id}\nTF: {TIMEFRAME}\n"
+           f"Pairs: {', '.join(syms[:10])}" + ("" if len(syms) <= 10 else f" …(+{len(syms)-10})"))
+    send_telegram(upd, reply_to_message_id=status_id)
+
+    # شغّل الحلقة
     asyncio.create_task(runner())
+
+# نقطة صحة
+@app.get("/health")
+def health():
+    return {"ok": True, "exchange": getattr(app.state, "exchange_id", EXCHANGE_NAME), "symbols": len(getattr(app.state, "symbols", []))}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
