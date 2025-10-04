@@ -1,11 +1,11 @@
-# trading_bot_menu_1_5.py
-# Fixes:
-# - Keepalive ping to prevent Render idle sleep
-# - Solid Telegram polling (deleteWebhook + offset + retries)
-# - ReplyKeyboard /start menu with working buttons
-# - (Strategy & scanning نفس السابق، بلا تغييرات على شروط الدخول)
+# trading_bot_menu_1_6.py
+# تغييرات:
+# - إيقاف الرسائل المكررة "لا توجد إشارات" مع تحكم بالدورية عبر ENV
+# - رسالة تشغيل تحتوي إصدار APP_VERSION/commit/timestamp
+# - قائمة /start ثابتة + polling متين + keepalive لعدم الإطفاء
+# - منطق الاستراتيجية كما هو (ما لمسناه)
 
-import os, json, asyncio, time, io, csv, sqlite3, random, traceback
+import os, json, asyncio, time, io, csv, sqlite3, random
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -31,7 +31,7 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 HTTP_PROXY = os.getenv("HTTP_PROXY") or None
 HTTPS_PROXY= os.getenv("HTTPS_PROXY") or None
 
-# Strategy (كما هي)
+# استراتيجية (بدون تغيير جوهري)
 COOLDOWN_CANDLES         = int(os.getenv("COOLDOWN_CANDLES","3"))
 BB_BANDWIDTH_MAX         = float(os.getenv("BB_BANDWIDTH_MAX","0.035"))
 ATR_SL_MULT              = float(os.getenv("ATR_SL_MULT","1.5"))
@@ -53,11 +53,21 @@ COOLDOWN_PER_SYMBOL_CANDLES = int(os.getenv("COOLDOWN_PER_SYMBOL_CANDLES","12"))
 LOG_DB_PATH              = os.getenv("LOG_DB_PATH","bot_stats.db")
 POLL_COMMANDS            = os.getenv("POLL_COMMANDS","true").lower()=="true"
 POLL_INTERVAL            = int(os.getenv("POLL_INTERVAL","10"))
-SEND_NO_SIGNAL_SUMMARY   = os.getenv("SEND_NO_SIGNAL_SUMMARY","false").lower()=="true"
 
-# Keepalive لمنع الإطفاء
+# تحكم الملخّصات (لا تُرسل تلقائيًا إلا إذا حددت واحدة)
+NO_SIG_EVERY_N_CYCLES    = int(os.getenv("NO_SIGNAL_SUMMARY_EVERY_N_CYCLES","0"))
+NO_SIG_EVERY_MINUTES     = int(os.getenv("NO_SIGNAL_SUMMARY_EVERY_MINUTES","0"))
+
+# Keepalive
 KEEPALIVE_URL            = (os.getenv("KEEPALIVE_URL") or "").strip()
-KEEPALIVE_INTERVAL       = int(os.getenv("KEEPALIVE_INTERVAL","240"))  # 4 دقائق
+KEEPALIVE_INTERVAL       = int(os.getenv("KEEPALIVE_INTERVAL","240"))
+
+# إصدار
+APP_VERSION = (
+    os.getenv("APP_VERSION")
+    or (os.getenv("RENDER_GIT_COMMIT","")[:7] if os.getenv("RENDER_GIT_COMMIT") else "")
+    or datetime.utcnow().strftime("ts%Y%m%d-%H%M")
+)
 
 # ================= Telegram =================
 TG_API   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -71,7 +81,6 @@ def _reply_kb(rows: List[List[str]]) -> str:
     return json.dumps({
         "keyboard":[[{"text":t} for t in row] for row in rows],
         "resize_keyboard": True,
-        "one_time_keyboard": False,
         "is_persistent": True
     })
 
@@ -85,12 +94,10 @@ def send_telegram(text: str, reply_to_message_id: Optional[int]=None,
     if reply_to_message_id: data["reply_to_message_id"] = reply_to_message_id
     if reply_markup: data["reply_markup"] = reply_markup
     try:
-        resp = requests.post(SEND_URL, data=data, timeout=25)
-        j = resp.json()
-        if not j.get("ok"):
-            print("Telegram error:", j); return None
+        r = requests.post(SEND_URL, data=data, timeout=25).json()
+        if not r.get("ok"): print("Telegram error:", r); return None
         _last_send_ts = time.time()
-        return j["result"]["message_id"]
+        return r["result"]["message_id"]
     except Exception as e:
         print("Telegram send error:", e); return None
 
@@ -98,9 +105,8 @@ def send_document(filename: str, file_bytes: bytes, caption: str="") -> bool:
     try:
         files={"document":(filename, io.BytesIO(file_bytes))}
         data={"chat_id": CHAT_ID, "caption": caption}
-        r=requests.post(DOC_URL, data=data, files=files, timeout=60)
-        j=r.json()
-        if not j.get("ok"): print("send_document error:", j); return False
+        r=requests.post(DOC_URL, data=data, files=files, timeout=60).json()
+        if not r.get("ok"): print("send_document error:", r); return False
         return True
     except Exception as e:
         print("send_document exception:", e); return False
@@ -133,24 +139,19 @@ def atr(df: pd.DataFrame, n=14):
 def clamp(x,a,b): return max(a, min(b,x))
 
 # ================ CCXT & Symbols ================
-EXC = {
-    "bybit": ccxt.bybit, "okx": ccxt.okx, "kucoinfutures": ccxt.kucoinfutures,
-    "bitget": ccxt.bitget, "gate": ccxt.gate, "binance": ccxt.binance, "krakenfutures": ccxt.krakenfutures
-}
+EXC={"bybit":ccxt.bybit,"okx":ccxt.okx,"kucoinfutures":ccxt.kucoinfutures,"bitget":ccxt.bitget,
+     "gate":ccxt.gate,"binance":ccxt.binance,"krakenfutures":ccxt.krakenfutures}
 def make_exchange(name:str):
     klass=EXC.get(name, ccxt.okx)
-    cfg={"enableRateLimit":True, "timeout":20000, "options":{"defaultType":"swap","defaultSubType":"linear"}}
+    cfg={"enableRateLimit":True,"timeout":20000,"options":{"defaultType":"swap","defaultSubType":"linear"}}
     if HTTP_PROXY or HTTPS_PROXY: cfg["proxies"]={"http":HTTP_PROXY,"https":HTTPS_PROXY}
     return klass(cfg)
 def load_markets_linear_only(ex):
     last=None
     for i,b in enumerate([1.5,3,6],1):
-        try:
-            ex.load_markets(reload=True, params={"category":"linear","type":"swap"}); return
+        try: ex.load_markets(reload=True, params={"category":"linear","type":"swap"}); return
         except Exception as e:
-            last=e; print(f"[load_markets {i}] {type(e).__name__}: {str(e)[:180]}")
-            if "403" in str(e) or "451" in str(e): break
-            time.sleep(b)
+            last=e; print(f"[load_markets {i}] {type(e).__name__}: {str(e)[:160]}"); time.sleep(b)
     raise last
 def try_failover(primary:str)->Tuple[ccxt.Exchange,str]:
     last=None
@@ -158,14 +159,12 @@ def try_failover(primary:str)->Tuple[ccxt.Exchange,str]:
         try:
             ex=make_exchange(name); load_markets_linear_only(ex); return ex,name
         except Exception as e:
-            last=e; print("[failover]", name, "failed:", type(e).__name__, str(e)[:120])
+            last=e; print("[failover]", name, "failed:", type(e).__name__, str(e)[:100])
     raise last or SystemExit("No exchange available.")
-
 def normalize_symbols_for_exchange(ex, syms:List[str])->List[str]:
     if ex.id=="bybit":
         return [s + (":USDT" if s.endswith("/USDT") and ":USDT" not in s else "") for s in syms]
     return syms
-
 def list_all_futures_symbols(ex)->List[str]:
     syms=[]
     for m in ex.markets.values():
@@ -174,7 +173,6 @@ def list_all_futures_symbols(ex)->List[str]:
     syms=sorted(set(syms))
     if MAX_SYMBOLS>0: syms=syms[:MAX_SYMBOLS]
     return normalize_symbols_for_exchange(ex, syms)
-
 def parse_symbols_from_env(ex, val:str)->List[str]:
     key=(val or "").strip().upper()
     if key in ("ALL","AUTO_FUTURES","AUTO","AUTO_SWAP","AUTO_LINEAR"):
@@ -197,7 +195,6 @@ async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
         return df
     except Exception as e:
         return f"خطأ المنصة: {ex.id} {type(e).__name__} {str(e)[:200]}"
-
 async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
     try:
         t=await asyncio.to_thread(ex.fetch_ticker, symbol)
@@ -216,16 +213,15 @@ def db_conn(): con=sqlite3.connect(LOG_DB_PATH); con.execute("PRAGMA journal_mod
 def db_init():
     con=db_conn()
     con.execute("""CREATE TABLE IF NOT EXISTS signals(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT,
-        side TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL, tp4 REAL, confidence INTEGER, msg_id INTEGER);""")
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT,
+      side TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL, tp4 REAL, confidence INTEGER, msg_id INTEGER);""")
     con.execute("""CREATE TABLE IF NOT EXISTS outcomes(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, ts INTEGER, event TEXT, idx INTEGER, price REAL);""")
+      id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, ts INTEGER, event TEXT, idx INTEGER, price REAL);""")
     con.execute("""CREATE TABLE IF NOT EXISTS nosignal_reasons(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT, reasons TEXT);""")
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT, reasons TEXT);""")
     con.execute("""CREATE TABLE IF NOT EXISTS errors(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT, message TEXT);""")
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT, message TEXT);""")
     con.commit(); con.close()
-
 def db_insert_signal(ts,ex,sym,side,entry,sl,tps,conf,msg_id)->int:
     con=db_conn(); cur=con.cursor()
     cur.execute("INSERT INTO signals(ts,exchange,symbol,side,entry,sl,tp1,tp2,tp3,tp4,confidence,msg_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -241,29 +237,24 @@ def db_insert_error(ts,ex,sym,msg):
     con=db_conn(); con.execute("INSERT INTO errors(ts,exchange,symbol,message) VALUES(?,?,?,?)",
                                (ts,ex,sym,msg)); con.commit(); con.close()
 
-# ================ Strategy ================
-def compute_confidence(df: pd.DataFrame, side:str, bb_bw_now:float, c_prev:float, c_now:float,
-                       band_prev:float, band_now:float, macd_now:float, macd_sig:float,
-                       r14:float, atr_now:float) -> int:
+# ================ Strategy =================
+def ema_series(s,n): return s.ewm(span=n,adjust=False).mean()
+def compute_confidence(df,side,bb_bw_now,c_prev,c_now,band_prev,band_now,macd_now,macd_sig,r14,atr_now)->int:
     tight = clamp((BB_BANDWIDTH_MAX - bb_bw_now)/max(BB_BANDWIDTH_MAX,1e-9), 0, 1)
     breakout = clamp(((c_now - band_now) if side=="LONG" else (band_now - c_now))/max(atr_now,1e-9), 0, 1)
     mom = clamp(abs(macd_now - macd_sig)/max(atr_now,1e-9), 0, 1)
     rsi_target = 60 if side=="LONG" else 40
     rsi_score = clamp(1 - abs(r14 - rsi_target)/20.0, 0, 1)
-    conf = 100 * (0.25*tight + 0.35*breakout + 0.2*mom + 0.2*rsi_score)
-    return int(round(conf))
-
+    return int(round(100 * (0.25*tight + 0.35*breakout + 0.2*mom + 0.2*rsi_score)))
 def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
-    if df is None or len(df)<60:
-        return None, {"insufficient_data":True}
+    if df is None or len(df)<60: return None, {"insufficient_data":True}
     c=df["close"]; h=df["high"]; l=df["low"]
     ma20, bb_up, bb_dn, bb_bw = bollinger(c,20,2.0)
     macd_line, macd_sig = macd(c,12,26,9)
-    r = rsi(c,14)
-    atr14 = atr(df,14)
+    r = rsi(c,14); atr14 = atr(df,14)
     ema50 = ema(c,50); ema200=ema(c,200)
 
-    i2, i1 = -3, -2
+    i2,i1=-3,-2
     try:
         c_prev, c_now = float(c.iloc[i2]), float(c.iloc[i1])
         up_prev, up_now = float(bb_up.iloc[i2]), float(bb_up.iloc[i1])
@@ -281,10 +272,8 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     crossed_down = (c_prev >= dn_prev) and (c_now < dn_now)
     trend_up = e50>e200; trend_down = e50<e200
 
-    try:
-        avg_usdt=float((df["volume"]*c).tail(VOL_LOOKBACK).mean())
-    except Exception:
-        avg_usdt=0.0
+    try: avg_usdt=float((df["volume"]*c).tail(VOL_LOOKBACK).mean())
+    except Exception: avg_usdt=0.0
 
     if (atr_pct < MIN_ATR_PCT) or (avg_usdt < MIN_AVG_VOL_USDT) or (not squeeze_ok):
         return None, {"atr_pct":round(atr_pct,3), "avg_vol_usdt":int(avg_usdt), "squeeze":squeeze_ok}
@@ -294,34 +283,33 @@ def smart_signal(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     if not (long_ok or short_ok):
         return None, {"cross_up":crossed_up,"cross_down":crossed_down,
                       "macd_vs_signal":f"{round(macd_now,4)} vs {round(sig_now,4)}",
-                      "rsi14":round(r14,2),
-                      "trend":"up" if trend_up else ("down" if trend_down else "flat"),
+                      "rsi14":round(r14,2),"trend":"up" if trend_up else ("down" if trend_down else "flat"),
                       "bw_now":round(bw_now,5)}
 
     side="LONG" if long_ok else "SHORT"
     band_now = up_now if side=="LONG" else dn_now
-    conf = compute_confidence(df, side, bw_now, c_prev, c_now, (up_prev if side=="LONG" else dn_prev),
-                              band_now, macd_now, sig_now, r14, atr_now)
+    conf = compute_confidence(df, side, bw_now, c_prev, c_now,
+                              (up_prev if side=="LONG" else dn_prev), band_now,
+                              macd_now, sig_now, r14, atr_now)
 
     # SL واقعي
     recent_lows  = float(l.tail(SL_LOOKBACK).min())
     recent_highs = float(h.tail(SL_LOOKBACK).max())
-    entry=c_now; atr_dist = ATR_SL_MULT*max(atr_now,1e-12)
+    entry=c_now; atr_dist=ATR_SL_MULT*max(atr_now,1e-12)
     if side=="LONG":
         sl_raw = min(recent_lows, entry - atr_dist)
-        min_gap = entry*(MIN_SL_PCT/100.0); max_gap = entry*(MAX_SL_PCT/100.0)
+        min_gap = entry*(MIN_SL_PCT/100.0); max_gap=entry*(MAX_SL_PCT/100.0)
         gap = entry - sl_raw
         if gap < min_gap: sl_raw = entry - min_gap
         if gap > max_gap: sl_raw = entry - max_gap
     else:
         sl_raw = max(recent_highs, entry + atr_dist)
-        min_gap = entry*(MIN_SL_PCT/100.0); max_gap = entry*(MAX_SL_PCT/100.0)
+        min_gap = entry*(MIN_SL_PCT/100.0); max_gap=entry*(MAX_SL_PCT/100.0)
         gap = sl_raw - entry
         if gap < min_gap: sl_raw = entry + min_gap
         if gap > max_gap: sl_raw = entry + max_gap
     sl=float(sl_raw)
-    tps = [entry*(1+p/100.0) for p in TP_PCTS] if side=="LONG" else [entry*(1-p/100.0) for p in TP_PCTS]
-
+    tps=[entry*(1+p/100.0) for p in TP_PCTS] if side=="LONG" else [entry*(1-p/100.0) for p in TP_PCTS]
     return ({"side":side,"entry":float(entry),"sl":sl,"tps":[float(x) for x in tps],
              "confidence":int(conf)}, {})
 
@@ -338,62 +326,52 @@ def crossed_levels(side:str, price:float, tps:List[float], sl:float, hit:List[bo
 def pct_profit(side:str, entry:float, exit_price:float)->float:
     return (exit_price/entry-1.0)*100.0 if side=="LONG" else (1.0-exit_price/entry)*100.0
 def elapsed_text(start_ts:int, end_ts:int)->str:
-    mins = max(0, end_ts - start_ts)//60
-    return (f"{mins} دقيقة" if mins<60 else f"{mins//60} ساعة {mins%60} دقيقة")
+    mins=max(0,end_ts-start_ts)//60
+    return f"{mins} دقيقة" if mins<60 else f"{mins//60} ساعة {mins%60} دقيقة"
 
 # ================ FastAPI ================
 app=FastAPI()
 @app.get("/")
 def root():
-    return {"ok":True,"exchange":getattr(app.state,"exchange_id",EXCHANGE_NAME),
-            "tf":TIMEFRAME,"symbols":len(getattr(app.state,"symbols",[])),
-            "min_confidence":MIN_CONFIDENCE}
+    return {"ok":True,"version":APP_VERSION,"exchange":getattr(app.state,"exchange_id",EXCHANGE_NAME),
+            "tf":TIMEFRAME,"symbols":len(getattr(app.state,"symbols",[]))}
 
 # ================ Scan & Trade ================
 async def fetch_and_signal(ex, symbol:str, holder):
     global _last_cycle_alerts
     out=await fetch_ohlcv_safe(ex, symbol, TIMEFRAME, OHLCV_LIMIT)
-    if isinstance(out,str):
-        db_insert_error(unix_now(),ex.id,symbol,out); return
-    if out is None or len(out)<60:
-        db_insert_nosignal(unix_now(),ex.id,symbol,{"insufficient_data":True}); return
+    if isinstance(out,str): db_insert_error(unix_now(),ex.id,symbol,out); return
+    if out is None or len(out)<60: db_insert_nosignal(unix_now(),ex.id,symbol,{"insufficient_data":True}); return
 
-    st = signal_state.get(symbol, {})
+    st = signal_state.get(symbol,{})
     closed_idx = len(out)-2
-    if closed_idx < st.get("cooldown_until_idx",-999999):
-        return
+    if closed_idx < st.get("cooldown_until_idx",-999999): return
     if symbol in open_trades: return
 
     sig, reasons = smart_signal(out)
     if not sig:
-        db_insert_nosignal(unix_now(), ex.id, symbol, reasons or {"note":"no_setup"}); return
-
+        db_insert_nosignal(unix_now(),ex.id,symbol,reasons or {"note":"no_setup"}); return
     if sig["confidence"] < MIN_CONFIDENCE:
-        db_insert_nosignal(unix_now(), ex.id, symbol, {**reasons, "confidence_lt_min":sig["confidence"]}); return
+        db_insert_nosignal(unix_now(),ex.id,symbol,{**reasons,"confidence_lt_min":sig["confidence"]}); return
     if _last_cycle_alerts >= MAX_ALERTS_PER_CYCLE:
-        db_insert_nosignal(unix_now(), ex.id, symbol, {"cycle_cap_reached":True, "confidence":sig["confidence"]}); return
+        db_insert_nosignal(unix_now(),ex.id,symbol,{"cycle_cap_reached":True}); return
 
-    pretty=symbol_pretty(symbol)
-    side_txt="طويل 🟢" if sig["side"]=="LONG" else "قصير 🔴"
-    entry,sl,tps,conf = sig["entry"],sig["sl"],sig["tps"],sig["confidence"]
+    pretty=symbol_pretty(symbol); side_txt="طويل 🟢" if sig["side"]=="LONG" else "قصير 🔴"
+    entry,sl,tps,conf=sig["entry"],sig["sl"],sig["tps"],sig["confidence"]
     mid=send_telegram(
         f"#{pretty} - {side_txt}\n\n"
-        f"نقطة الدخول: {entry}\n"
-        f"وقف الخسارة: {sl}\n\n"
+        f"نقطة الدخول: {entry}\nوقف الخسارة: {sl}\n\n"
         f"الهدف 1: {tps[0]}\nالهدف 2: {tps[1]}\nالهدف 3: {tps[2]}\nالهدف 4: {tps[3]}\n\n"
-        f"نسبة الثقة: {conf}%",
-        reply_to_message_id=holder.get("id")
+        f"نسبة الثقة: {conf}%"
     )
     if mid:
-        ts_now = unix_now()
+        ts_now=unix_now()
         open_trades[symbol]={"side":sig["side"],"entry":entry,"sl":sl,"tps":tps,"hit":[False]*4,
                              "msg_id":mid,"signal_id":None,"opened_ts":ts_now}
-        signal_state[symbol]={"last_entry":entry,"last_side":sig["side"],
-                              "last_candle_idx":closed_idx,
-                              "cooldown_until_idx":closed_idx+COOLDOWN_PER_SYMBOL_CANDLES}
+        signal_state[symbol]={"cooldown_until_idx":closed_idx+COOLDOWN_PER_SYMBOL_CANDLES}
         sid=db_insert_signal(ts_now, app.state.exchange.id, symbol, sig["side"], entry, sl, tps, conf, mid)
         open_trades[symbol]["signal_id"]=sid
-        _last_cycle_alerts += 1
+        _last_cycle_alerts+=1
 
 async def check_open_trades(ex):
     for sym, pos in list(open_trades.items()):
@@ -402,28 +380,18 @@ async def check_open_trades(ex):
         if not res: continue
         kind,idx=res; ts=unix_now()
         if kind=="SL":
-            pr = pct_profit(pos["side"], pos["entry"], price or pos["sl"])
-            send_telegram(
-                f"#{symbol_pretty(sym)}\nتم ضرب وقف الخسارة ❌\n"
-                f"النتيجة: {round(pr,4)}% 📉\n"
-                f"في: {elapsed_text(pos.get('opened_ts',ts), ts)} ⏰",
-                reply_to_message_id=pos["msg_id"]
-            )
+            pr=pct_profit(pos["side"],pos["entry"],price or pos["sl"])
+            send_telegram(f"#{symbol_pretty(sym)}\nتم ضرب وقف الخسارة ❌\nالنتيجة: {round(pr,4)}% 📉\nفي: {elapsed_text(pos['opened_ts'],ts)} ⏰")
             if pos.get("signal_id"): db_insert_outcome(pos["signal_id"],ts,"SL",-1,price or 0.0)
             del open_trades[sym]
         else:
             pos["hit"][idx]=True; tp=pos["tps"][idx]
-            pr = pct_profit(pos["side"], pos["entry"], tp if price is None else price)
-            send_telegram(
-                f"#{symbol_pretty(sym)}\nتم الوصول إلى الهدف {idx+1} ✅\n"
-                f"الربح: {round(pr,4)}% 📈\n"
-                f"في: {elapsed_text(pos.get('opened_ts',ts), ts)} ⏰",
-                reply_to_message_id=pos["msg_id"]
-            )
+            pr=pct_profit(pos["side"],pos["entry"],tp if price is None else price)
+            send_telegram(f"#{symbol_pretty(sym)}\nتم الوصول إلى الهدف {idx+1} ✅\nالربح: {round(pr,4)}% 📈\nفي: {elapsed_text(pos['opened_ts'],ts)} ⏰")
             if pos.get("signal_id"): db_insert_outcome(pos["signal_id"],ts,f"TP{idx+1}",idx,price or tp)
             if all(pos["hit"]): del open_trades[sym]
 
-async def scan_once(ex, symbols:List[str], holder):
+async def scan_once(ex, symbols:List[str]):
     global _last_cycle_alerts
     _last_cycle_alerts = 0
     await check_open_trades(ex)
@@ -431,51 +399,43 @@ async def scan_once(ex, symbols:List[str], holder):
     random.shuffle(symbols)
     sem=asyncio.Semaphore(3)
     async def worker(s):
-        async with sem: await fetch_and_signal(ex,s,holder)
+        async with sem: await fetch_and_signal(ex,s,{})
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
-    if SEND_NO_SIGNAL_SUMMARY and _last_cycle_alerts==0:
-        send_telegram("> ℹ️ لا توجد إشارات بهذه الدورة (الأسباب محفوظة في القاعدة).",
-                      reply_to_message_id=holder.get("id"))
 
-# ================ Text builders ================
-def stats_text(days: int = 1) -> str:
+# ================ تقارير/أوامر ================
+def stats_text(days:int=1)->str:
     try:
-        con = db_conn(); cur = con.cursor()
+        con=db_conn(); cur=con.cursor()
         cur.execute("SELECT COUNT(*) FROM signals WHERE ts >= strftime('%s','now', ?)", (f"-{days} day",))
-        total = cur.fetchone()[0] or 0
-        cur.execute("""SELECT 
-                         SUM(CASE WHEN event LIKE 'TP%' THEN 1 ELSE 0 END),
-                         SUM(CASE WHEN event='SL' THEN 1 ELSE 0 END)
-                       FROM outcomes WHERE ts >= strftime('%s','now', ?)""", (f"-{days} day",))
-        row = cur.fetchone() or (0,0)
-        tp, sl = row[0] or 0, row[1] or 0
+        total=cur.fetchone()[0] or 0
+        cur.execute("""SELECT SUM(CASE WHEN event LIKE 'TP%' THEN 1 ELSE 0 END),
+                              SUM(CASE WHEN event='SL' THEN 1 ELSE 0 END)
+                       FROM outcomes WHERE ts >= strftime('%s','now', ?)""",(f"-{days} day",))
+        row=cur.fetchone() or (0,0); tp,sl=row[0] or 0, row[1] or 0
         con.close()
         if total==0 and tp==0 and sl==0: return "لا توجد بيانات كافية بعد."
-        return (f"📊 إحصائيات آخر {days} يوم:\n"
-                f"- إشارات: {total}\n- TP: {tp}\n- SL: {sl}")
+        return f"📊 إحصائيات آخر {days} يوم:\n- إشارات: {total}\n- TP: {tp}\n- SL: {sl}"
     except Exception as e:
         return f"⚠️ خطأ الإحصائيات: {e}"
 
-def reasons_text(window: str = "1d") -> str:
-    unit = window[-1].lower()
-    num  = int(''.join([ch for ch in window if ch.isdigit()]) or 1)
-    sql_win = f"-{num} {'hour' if unit=='h' else 'day'}"
+def reasons_text(window:str="1d")->str:
+    unit=window[-1].lower(); num=int(''.join([ch for ch in window if ch.isdigit()]) or 1)
+    sql_win=f"-{num} {'hour' if unit=='h' else 'day'}"
     try:
-        con = db_conn(); cur = con.cursor()
+        con=db_conn(); cur=con.cursor()
         cur.execute("SELECT reasons FROM nosignal_reasons WHERE ts >= strftime('%s','now', ?)", (sql_win,))
-        rows = cur.fetchall(); con.close()
+        rows=cur.fetchall(); con.close()
         if not rows: return "لا توجد أسباب مسجلة في هذه المدة."
         from collections import Counter
-        cnt = Counter()
+        cnt=Counter()
         for (js,) in rows:
             try:
-                r=json.loads(js) if isinstance(js,str) else {}
-                if isinstance(r,dict):
-                    for k in r.keys(): cnt[k]+=1
+                d=json.loads(js) if isinstance(js,str) else {}
+                if isinstance(d,dict):
+                    for k in d.keys(): cnt[k]+=1
                 else: cnt["other"]+=1
             except: cnt["other"]+=1
-        lines = [f"📄 أهم الأسباب ({window}):"]
-        for k,v in cnt.most_common(10): lines.append(f"- {k}: {v}")
+        lines=[f"📄 أهم الأسباب ({window}):"]+[f"- {k}: {v}" for k,v in cnt.most_common(10)]
         return "\n".join(lines)
     except Exception as e:
         return f"⚠️ خطأ قراءة الأسباب: {e}"
@@ -484,106 +444,89 @@ def last_signals_text(limit:int=10)->str:
     try:
         con=db_conn(); cur=con.cursor()
         cur.execute("""SELECT s.id, datetime(s.ts,'unixepoch'), s.symbol, s.side, s.entry, s.sl, s.confidence,
-                       (SELECT event FROM outcomes o WHERE o.signal_id=s.id ORDER BY o.ts LIMIT 1)
+                              (SELECT event FROM outcomes o WHERE o.signal_id=s.id ORDER BY o.ts LIMIT 1)
                        FROM signals s ORDER BY s.id DESC LIMIT ?""",(limit,))
         rows=cur.fetchall(); con.close()
         if not rows: return "لا توجد إشارات مسجلة بعد."
-        out=["📜 آخر الإشارات:"]
-        for r in rows:
-            out.append(f"#{symbol_pretty(r[2])} {r[3]} conf:{r[6]} → {r[7] or '—'} @ {r[1]}")
+        out=["📜 آخر الإشارات:"]+[f"#{symbol_pretty(r[2])} {r[3]} conf:{r[6]} → {r[7] or '—'} @ {r[1]}" for r in rows]
         return "\n".join(out)
     except Exception as e:
         return f"⚠️ خطأ قراءة السجل: {e}"
 
 def open_positions_text()->str:
     if not open_trades: return "لا توجد صفقات مفتوحة."
-    out=["📌 صفقات مفتوحة:"]
-    for s,p in open_trades.items():
-        out.append(f"#{symbol_pretty(s)} {p['side']} دخول:{p['entry']} SL:{p['sl']} TP1..4:{', '.join([str(x) for x in p['tps']])}")
+    out=["📌 صفقات مفتوحة:"]+[f"#{symbol_pretty(s)} {p['side']} دخول:{p['entry']} SL:{p['sl']}" for s,p in open_trades.items()]
     return "\n".join(out)
 
 def export_csv_bytes(days:int=14)->bytes:
     con=db_conn(); cur=con.cursor()
     cur.execute("""SELECT s.id, s.ts, s.exchange, s.symbol, s.side, s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.tp4, s.confidence,
-                          (SELECT GROUP_CONCAT(event||':'||price,'|') FROM outcomes o WHERE o.signal_id=s.id) AS outcomes
+                          (SELECT GROUP_CONCAT(event||':'||price,'|') FROM outcomes o WHERE o.signal_id=s.id)
                    FROM signals s WHERE s.ts >= strftime('%s','now', ?) ORDER BY s.id DESC""",(f"-{days} day",))
     rows=cur.fetchall(); con.close()
-    out=io.StringIO(); w=csv.writer(out)
-    w.writerow(["id","ts","exchange","symbol","side","entry","sl","tp1","tp2","tp3","tp4","confidence","outcomes"])
+    out=io.StringIO(); w=csv.writer(out); w.writerow(
+        ["id","ts","exchange","symbol","side","entry","sl","tp1","tp2","tp3","tp4","confidence","outcomes"])
     for r in rows: w.writerow(r)
     return out.getvalue().encode("utf-8")
 
 # ================ Telegram Polling ================
-_poll_offset = 0
+_poll_offset=0
 def tg_delete_webhook():
-    try:
-        requests.post(TG_DELETE_WEBHOOK, data={"drop_pending_updates": False}, timeout=10)
-    except Exception as e:
-        print("deleteWebhook error:", e)
+    try: requests.post(TG_DELETE_WEBHOOK, data={"drop_pending_updates": False}, timeout=10)
+    except Exception as e: print("deleteWebhook error:", e)
 
 def parse_cmd(text:str)->Tuple[str,str]:
     t=(text or "").strip()
     if t.startswith("/"):
-        parts=t.split(maxsplit=1); cmd=parts[0].lower()
-        arg=parts[1].strip() if len(parts)>1 else ""
+        parts=t.split(maxsplit=1); cmd=parts[0].lower(); arg=parts[1].strip() if len(parts)>1 else ""
         if "@" in cmd: cmd=cmd.split("@",1)[0]
         return cmd,arg
-    # أزرار القائمة ترجع نصوص عادية
-    normalized=t.strip()
-    return normalized, ""
+    return t,""
 
 async def poll_telegram_commands():
-    if not POLL_COMMANDS: return
+    if not os.getenv("POLL_COMMANDS","true").lower()=="true": return
     tg_delete_webhook()
     global _poll_offset
     while True:
         try:
-            resp=requests.get(TG_GET_UPDATES, params={"timeout":25,"offset":_poll_offset+1}, timeout=35)
-            data=resp.json()
-            if data.get("ok"):
-                for upd in data.get("result",[]):
+            r=requests.get(TG_GET_UPDATES, params={"timeout":25,"offset":_poll_offset+1}, timeout=35).json()
+            if r.get("ok"):
+                for upd in r.get("result",[]):
                     _poll_offset=max(_poll_offset, upd["update_id"])
                     msg=upd.get("message") or upd.get("edited_message")
                     if not msg or str(msg.get("chat",{}).get("id"))!=str(CHAT_ID): continue
                     text=msg.get("text","")
                     cmd,arg=parse_cmd(text)
 
-                    if cmd in ("/start","🔁 تحديث القائمة"):
-                        send_start_menu()
+                    if cmd in ("/start","🔁 تحديث القائمة"): send_start_menu()
                     elif cmd in ("📊 الإحصائيات","/stats"):
-                        days = 1
-                        if arg.isdigit(): days=int(arg)
-                        send_telegram(stats_text(days))
+                        days=int(arg) if arg.isdigit() else 1; send_telegram(stats_text(days))
                     elif cmd in ("📄 الأسباب","/reasons","/reason"):
-                        win = arg.strip() or "1d"   # أمثلة: 6h, 3d, 1d
-                        send_telegram(reasons_text(win))
+                        win=arg or "1d"; send_telegram(reasons_text(win))
                     elif cmd in ("📜 آخر الإشارات","/last"):
-                        lim = int(arg) if arg.isdigit() else 10
-                        send_telegram(last_signals_text(lim))
-                    elif cmd in ("📌 المفتوحة","/open"):
-                        send_telegram(open_positions_text())
+                        lim=int(arg) if arg.isdigit() else 10; send_telegram(last_signals_text(lim))
+                    elif cmd in ("📌 المفتوحة","/open"): send_telegram(open_positions_text())
                     elif cmd in ("⬇️ تصدير CSV","/export"):
-                        days=int(arg) if arg.isdigit() else 14
-                        send_document(f"signals_{days}d.csv", export_csv_bytes(days), caption="تصدير الإشارات")
+                        days=int(arg) if arg.isdigit() else 14; send_document(f"signals_{days}d.csv", export_csv_bytes(days))
+                    elif cmd in ("/version","نسخة","إصدار"):
+                        send_telegram(f"الإصدار: v{APP_VERSION}")
                     else:
-                        # أي نص غير معروف -> أعد القائمة
                         send_start_menu()
         except Exception as e:
             print("poll error:", e)
         await asyncio.sleep(POLL_INTERVAL)
 
-# ================ Keepalive (منع الإطفاء) ================
+# ================ Keepalive =================
 async def keepalive_task():
     if not KEEPALIVE_URL: return
     while True:
-        try:
-            requests.get(KEEPALIVE_URL, timeout=10)
-        except Exception as e:
-            print("keepalive error:", e)
+        try: requests.get(KEEPALIVE_URL, timeout=10)
+        except Exception as e: print("keepalive error:", e)
         await asyncio.sleep(max(60, KEEPALIVE_INTERVAL))
 
-# ================ Startup / Runner ================
+# ================ Startup / Runner ==========
 app.state.exchange=None; app.state.exchange_id=EXCHANGE_NAME; app.state.symbols=[]
+app.state.cycle_count=0; app.state.last_no_sig_ts=0
 
 def attempt_build():
     ex,used = try_failover(EXCHANGE_NAME)
@@ -593,26 +536,34 @@ def attempt_build():
 @app.on_event("startup")
 async def _startup():
     db_init()
-    status_id = send_telegram(f"> توصيات تداول Ai:\n✅ البوت اشتغل\nExchange: (initializing)\nTF: {TIMEFRAME}\nPairs: (loading…)",
-                              reply_markup=start_menu_markup())
-    app.state.status_msg_id_holder={"id":status_id}
+    send_telegram(f"> توصيات تداول Ai v{APP_VERSION}:\n✅ البوت اشتغل\nExchange: (initializing)\nTF: {TIMEFRAME}\nPairs: (loading…)",
+                  reply_markup=start_menu_markup())
     attempt_build()
     syms=app.state.symbols; ex_id=app.state.exchange_id
-    send_telegram(f"> تحديث الإقلاع:\nExchange: {ex_id}\nTF: {TIMEFRAME}\nPairs: {', '.join([symbol_pretty(s) for s in syms[:10]])}{'' if len(syms)<=10 else f' …(+{len(syms)-10})'}",
-                  reply_to_message_id=status_id)
-    # شغّل المهام الخلفية
+    send_telegram(f"> تحديث الإقلاع:\nExchange: {ex_id}\nTF: {TIMEFRAME}\nPairs: {', '.join([symbol_pretty(s) for s in syms[:10]])}{'' if len(syms)<=10 else f' …(+{len(syms)-10})'}")
     asyncio.create_task(runner())
     asyncio.create_task(poll_telegram_commands())
     asyncio.create_task(keepalive_task())
 
+async def maybe_send_no_signal_summary():
+    """يرسل ملخص عدم وجود إشارات فقط إذا استوفت شروط الدورية (دورات/دقائق)."""
+    if _last_cycle_alerts>0: return
+    now=time.time()
+    ok_cycles = (NO_SIG_EVERY_N_CYCLES>0 and app.state.cycle_count % NO_SIG_EVERY_N_CYCLES == 0)
+    ok_minutes= (NO_SIG_EVERY_MINUTES>0 and (now - app.state.last_no_sig_ts) >= NO_SIG_EVERY_MINUTES*60)
+    if ok_cycles or ok_minutes:
+        send_telegram("ℹ️ لا توجد إشارات في الفترة الحالية (الأسباب تُسجّل في القاعدة).")
+        app.state.last_no_sig_ts = now
+
 async def runner():
-    holder=app.state.status_msg_id_holder
     while True:
         try:
             if not app.state.symbols: attempt_build()
-            await scan_once(app.state.exchange, app.state.symbols, holder)
+            await scan_once(app.state.exchange, app.state.symbols)
+            app.state.cycle_count += 1
+            await maybe_send_no_signal_summary()
         except Exception as e:
-            send_telegram(f"⚠️ Loop error: {type(e).__name__} {str(e)[:180]}", reply_to_message_id=holder.get("id"))
+            send_telegram(f"⚠️ Loop error: {type(e).__name__} {str(e)[:160]}")
         await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__=="__main__":
