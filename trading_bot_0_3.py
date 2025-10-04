@@ -1,6 +1,6 @@
-# trading_bot_optimized_v2.0.0.py
-# النسخة المحسّنة - استراتيجية أقوى وأذكى 🚀
-# المتطلبات: pip install ccxt fastapi uvicorn pandas requests ta
+# trading_bot_quality_v3.0.0.py
+# النسخة المحسّنة الواقعية - جودة > كمية
+# المتطلبات: pip install ccxt fastapi uvicorn pandas requests
 
 import os, json, asyncio, time, io, csv, sqlite3, random, math, traceback
 from typing import Dict, List, Optional, Tuple
@@ -15,44 +15,43 @@ import uvicorn
 # ========================== [ ENV ] ==========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID        = os.getenv("CHAT_ID", "").strip()
-
 EXCHANGE_ENV   = os.getenv("EXCHANGE", "").strip().lower()
 SYMBOLS_ENV    = os.getenv("SYMBOLS", "").strip()
 TIMEFRAME_ENV  = os.getenv("TIMEFRAME", "").strip()
 
-# ========================== [ إعدادات محسّنة ] ==========================
+# ========================== [ إعدادات محسّنة واقعية ] ==========================
 EXCHANGE_NAME = EXCHANGE_ENV or "okx"
 TIMEFRAME     = TIMEFRAME_ENV or "5m"
 SYMBOLS_MODE  = SYMBOLS_ENV or "ALL"
 
-# ✨ إعدادات الفلترة المحسّنة - أكثر ذكاءً
-MIN_CONFIDENCE         = 48  # خفّضنا الحد لزيادة الفرص
-MIN_ATR_PCT            = 0.08  # قبول تقلبات أقل
-MIN_AVG_VOL_USDT       = 30_000  # حجم أقل للمزيد من الفرص
+# === فلترة صارمة للجودة العالية ===
+MIN_CONFIDENCE         = 62  # ثقة أعلى بكثير
+MIN_ATR_PCT            = 0.15  # تقلب كافي فقط
+MIN_AVG_VOL_USDT       = 100_000  # سيولة حقيقية فقط
 
-# نطاقات RSI محسّنة لصيد الفرص الذهبية
-RSI_LONG_MIN,  RSI_LONG_MAX  = 35, 75  # نطاق أوسع
-RSI_SHORT_MIN, RSI_SHORT_MAX = 25, 65
+# RSI - نطاقات أضيق للإشارات الأقوى
+RSI_LONG_MIN,  RSI_LONG_MAX  = 40, 65
+RSI_SHORT_MIN, RSI_SHORT_MAX = 35, 60
 
-# Bollinger Bands - أكثر مرونة
-BB_BANDWIDTH_MAX       = 0.055  # قبول انضغاطات أوسع قليلاً
-BB_BANDWIDTH_MAX_SOFT  = 0.10
-ALLOW_NO_SQUEEZE       = True
+# Bollinger Bands - انضغاط حقيقي فقط
+BB_BANDWIDTH_MAX       = 0.035  # أضيق بكثير
+BB_BANDWIDTH_MIN       = 0.008  # حد أدنى لتجنب السوق الميت
+ALLOW_NO_SQUEEZE       = False  # يجب أن يكون هناك انضغاط
 
-REQUIRE_TREND          = False  # نتداول مع وضد الترند
+REQUIRE_TREND          = True   # نتداول مع الترند فقط
 
-# ✨ أهداف وستوب أفضل - نسب ربح/خسارة محسّنة
-TP_PCTS                = [0.4, 0.8, 1.4, 2.2]  # أهداف أقرب وأكثر واقعية
-ATR_SL_MULT            = 2.2  # ستوب أوسع قليلاً لتجنب الاهتزازات
-SL_LOOKBACK            = 18  # نظرة أعمق للسوينغات
-MIN_SL_PCT, MAX_SL_PCT = 0.25, 2.5  # ستوب أكثر مرونة
+# === أهداف وستوب محسّنة - R/R أفضل ===
+TP_PCTS                = [0.6, 1.2, 2.0, 3.0]  # متدرجة واقعية
+ATR_SL_MULT            = 1.8  # ستوب أقرب للحماية
+SL_LOOKBACK            = 14
+MIN_SL_PCT, MAX_SL_PCT = 0.35, 2.0
 
-# إعدادات المسح
-SCAN_INTERVAL                 = 45  # مسح أسرع
-MIN_SIGNAL_GAP_SEC            = 4
-MAX_ALERTS_PER_CYCLE          = 10  # المزيد من الإشارات
-COOLDOWN_PER_SYMBOL_CANDLES   = 6  # كولداون أقصر
-MAX_SYMBOLS                   = 150  # المزيد من الأزواج
+# === إعدارات المسح - أقل ضوضاء ===
+SCAN_INTERVAL                 = 60  # مسح كل دقيقة
+MIN_SIGNAL_GAP_SEC            = 8   # وقت أطول بين الرسائل
+MAX_ALERTS_PER_CYCLE          = 5   # أقل إشارات، جودة أعلى
+COOLDOWN_PER_SYMBOL_CANDLES   = 12  # كولداون أطول بكثير
+MAX_SYMBOLS                   = 100
 
 NO_SIG_EVERY_N_CYCLES         = 0
 NO_SIG_EVERY_MINUTES          = 0
@@ -61,7 +60,7 @@ KEEPALIVE_URL      = ""
 KEEPALIVE_INTERVAL = 240
 
 BUILD_UTC     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-APP_VERSION   = f"2.0.0-OPTIMIZED ({BUILD_UTC})"
+APP_VERSION   = f"3.0.0-QUALITY ({BUILD_UTC})"
 POLL_COMMANDS = True
 POLL_INTERVAL = 10
 
@@ -120,10 +119,10 @@ def send_document(filename: str, file_bytes: bytes, caption: str="") -> bool:
 
 def start_menu_markup() -> str:
     return _reply_kb([
-        ["📊 الإحصائيات", "📈 تحليل متقدم"],
-        ["📄 الأسباب", "📜 آخر الإشارات"],
-        ["📌 المفتوحة", "⬇️ تصدير CSV"],
-        ["📋 تصدير تحليلي", "🔁 تحديث القائمة"]
+        ["الإحصائيات", "تحليل متقدم"],
+        ["الأسباب", "آخر الإشارات"],
+        ["المفتوحة", "تصدير CSV"],
+        ["تصدير تحليلي", "تحديث القائمة"]
     ])
 
 def send_start_menu():
@@ -159,43 +158,6 @@ def atr(df: pd.DataFrame, n=14):
     h,l,c = df["high"], df["low"], df["close"]
     tr=pd.concat([(h-l).abs(),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
-
-# ✨ مؤشر جديد: Stochastic للزخم
-def stochastic(df: pd.DataFrame, k_period=14, d_period=3):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    
-    lowest_low = low.rolling(window=k_period).min()
-    highest_high = high.rolling(window=k_period).max()
-    
-    k = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, 1e-12)
-    d = k.rolling(window=d_period).mean()
-    
-    return k, d
-
-# ✨ مؤشر جديد: ADX للقوة
-def adx(df: pd.DataFrame, period=14):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-    
-    tr = atr(df, 1)
-    atr_period = tr.rolling(window=period).mean()
-    
-    plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr_period)
-    minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr_period)
-    
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-12)
-    adx_val = dx.rolling(window=period).mean()
-    
-    return adx_val, plus_di, minus_di
 
 def clamp(x,a,b): 
     return max(a, min(b,x))
@@ -349,80 +311,93 @@ def db_insert_error(ts,ex,sym,msg):
     con.commit()
     con.close()
 
-# ================== ✨ الاستراتيجية المحسّنة والجبارة ==================
+# ================== الاستراتيجية المحسّنة - جودة عالية ==================
 def _f(x)->float:
     v=float(x)
     if math.isnan(v) or math.isinf(v): 
         raise ValueError("nan/inf")
     return v
 
-def compute_confidence_advanced(side:str, bw_now:float, c_prev:float, c_now:float, 
-                                band_now:float, macd_now:float, macd_sig:float, 
-                                r14:float, atr_now:float, stoch_k:float, stoch_d:float,
-                                adx_val:float, plus_di:float, minus_di:float,
-                                volume_ratio:float)->int:
+def compute_confidence_strict(side:str, bw_now:float, c_prev:float, c_now:float, 
+                              band_now:float, macd_now:float, macd_sig:float, 
+                              r14:float, atr_now:float, ema50:float, ema200:float,
+                              volume_ratio:float)->int:
     """
-    حساب الثقة المحسّن مع مؤشرات إضافية
+    حساب ثقة صارم - نعطي درجات عالية فقط للإعدادات القوية جداً
     """
-    # 1. انضغاط البولينجر (كلما أقل كلما أفضل)
-    tight = clamp((BB_BANDWIDTH_MAX_SOFT - bw_now)/max(BB_BANDWIDTH_MAX_SOFT,1e-9), 0, 1)
     
-    # 2. قوة الاختراق
-    breakout = clamp(((c_now - band_now) if side=="LONG" else (band_now - c_now))/max(atr_now,1e-9), 0, 1.5)
-    breakout = min(breakout, 1.0)
+    # 1. انضغاط BB - يجب أن يكون قوي
+    if bw_now > BB_BANDWIDTH_MAX or bw_now < BB_BANDWIDTH_MIN:
+        return 0
     
-    # 3. زخم MACD
-    mom = clamp(abs(macd_now - macd_sig)/max(atr_now,1e-9), 0, 1)
+    squeeze_score = clamp((BB_BANDWIDTH_MAX - bw_now) / BB_BANDWIDTH_MAX, 0, 1)
     
-    # 4. RSI المثالي
-    rsi_target = 60 if side=="LONG" else 40
-    rsi_score = clamp(1 - abs(r14 - rsi_target)/25.0, 0, 1)
+    # 2. قوة الاختراق - يجب أن يكون واضح
+    breakout_dist = abs(c_now - band_now)
+    breakout_score = clamp(breakout_dist / max(atr_now, 1e-9), 0, 1.5)
+    breakout_score = min(breakout_score, 1.0)
     
-    # 5. ✨ Stochastic - هل في زخم؟
-    if side == "LONG":
-        stoch_score = clamp((stoch_k - 30) / 40.0, 0, 1)  # نبي فوق 30 للشراء
-    else:
-        stoch_score = clamp((70 - stoch_k) / 40.0, 0, 1)  # نبي تحت 70 للبيع
+    if breakout_score < 0.3:  # اختراق ضعيف = رفض
+        return 0
     
-    # 6. ✨ ADX - قوة الترند
-    adx_score = clamp((adx_val - 20) / 30.0, 0, 1)  # أفضل لو ADX فوق 20
+    # 3. MACD momentum - يجب أن يدعم الاتجاه
+    macd_diff = abs(macd_now - macd_sig)
+    macd_score = clamp(macd_diff / max(atr_now, 1e-9), 0, 1)
     
-    # 7. ✨ اتجاه DI
-    if side == "LONG":
-        di_score = clamp((plus_di - minus_di) / 20.0, 0, 1)
-    else:
-        di_score = clamp((minus_di - plus_di) / 20.0, 0, 1)
+    # 4. RSI - يجب أن يكون في النطاق المثالي
+    rsi_target = 55 if side == "LONG" else 45
+    rsi_dev = abs(r14 - rsi_target)
+    rsi_score = clamp(1.0 - (rsi_dev / 15.0), 0, 1)
     
-    # 8. ✨ الحجم - هل السوق نشط؟
-    volume_score = clamp(volume_ratio - 0.8, 0, 1)  # نبي حجم فوق المعدل
+    # 5. قوة الترند - يجب أن يكون واضح
+    trend_strength = abs(ema50 - ema200) / max(ema200, 1e-9)
+    trend_score = clamp(trend_strength * 100, 0, 1)
     
-    # الأوزان المحسّنة
+    if side == "LONG" and ema50 <= ema200:
+        return 0
+    if side == "SHORT" and ema50 >= ema200:
+        return 0
+    
+    # 6. حجم التداول - يجب أن يكون أعلى من المعدل
+    volume_score = clamp((volume_ratio - 0.9) * 2, 0, 1)
+    
+    if volume_ratio < 0.8:  # حجم ضعيف = رفض
+        return 0
+    
+    # 7. تأكيد السعر - يجب أن يكون فوق/تحت EMA50
+    if side == "LONG" and c_now < ema50:
+        return 0
+    if side == "SHORT" and c_now > ema50:
+        return 0
+    
+    price_position_score = 1.0  # إذا وصلنا هنا = السعر في الموقع الصحيح
+    
+    # الأوزان - نركز على الأهم
     confidence = int(round(100 * (
-        0.18 * tight +          # انضغاط
-        0.22 * breakout +       # اختراق
-        0.12 * mom +            # MACD
-        0.12 * rsi_score +      # RSI
-        0.12 * stoch_score +    # Stochastic جديد
-        0.10 * adx_score +      # ADX جديد
-        0.08 * di_score +       # DI جديد
-        0.06 * volume_score     # Volume جديد
+        0.25 * squeeze_score +      # الانضغاط أهم شيء
+        0.25 * breakout_score +     # قوة الاختراق
+        0.15 * macd_score +         # زخم
+        0.12 * rsi_score +          # RSI
+        0.10 * trend_score +        # قوة الترند
+        0.08 * volume_score +       # حجم
+        0.05 * price_position_score # موقع السعر
     )))
     
     return max(0, min(100, confidence))
 
-def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
+def smart_signal_quality(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     """
-    الاستراتيجية المحسّنة مع مؤشرات إضافية
+    استراتيجية الجودة العالية - إشارات أقل، نتائج أفضل
     """
-    if df is None or len(df)<60: 
+    if df is None or len(df)<80: 
         return None, {"insufficient_data":True}
 
-    c=df["close"]
-    h=df["high"]
-    l=df["low"]
-    v=df["volume"]
+    c = df["close"]
+    h = df["high"]
+    l = df["low"]
+    v = df["volume"]
     
-    # المؤشرات الأساسية
+    # المؤشرات الأساسية فقط
     ma20, bb_up, bb_dn, bb_bw = bollinger(c, 20, 2.0)
     macd_line, macd_sig = macd(c, 12, 26, 9)
     r = rsi(c, 14)
@@ -430,11 +405,7 @@ def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     ema50 = ema(c, 50)
     ema200 = ema(c, 200)
     
-    # ✨ المؤشرات الجديدة
-    stoch_k, stoch_d = stochastic(df, 14, 3)
-    adx_val, plus_di, minus_di = adx(df, 14)
-    
-    # نسبة الحجم الحالي للمتوسط
+    # حجم التداول
     avg_volume = v.tail(30).mean()
     current_volume = v.iloc[-2]
     volume_ratio = current_volume / max(avg_volume, 1e-9)
@@ -448,20 +419,16 @@ def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         dn_prev = _f(bb_dn.iloc[i2])
         dn_now = _f(bb_dn.iloc[i1])
         bw_now = _f(bb_bw.iloc[i1])
+        bw_prev = _f(bb_bw.iloc[i2])
         macd_now = _f(macd_line.iloc[i1])
         sig_now = _f(macd_sig.iloc[i1])
+        macd_prev = _f(macd_line.iloc[i2])
+        sig_prev = _f(macd_sig.iloc[i2])
         r14 = _f(r.iloc[i1])
         atr_now = _f(atr14.iloc[i1])
         e50 = _f(ema50.iloc[i1])
         e200 = _f(ema200.iloc[i1])
-        ma20_prev = _f(ma20.iloc[i2])
-        
-        # ✨ المؤشرات الجديدة
-        stoch_k_now = _f(stoch_k.iloc[i1])
-        stoch_d_now = _f(stoch_d.iloc[i1])
-        adx_now = _f(adx_val.iloc[i1])
-        plus_di_now = _f(plus_di.iloc[i1])
-        minus_di_now = _f(minus_di.iloc[i1])
+        ma20_now = _f(ma20.iloc[i1])
         
     except Exception:
         return None, {"index_or_nan": True}
@@ -475,117 +442,84 @@ def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     except Exception:
         avg_usdt = 0.0
 
-    # ✨ فلترة أقل صرامة
-    if (atr_pct < MIN_ATR_PCT) or (avg_usdt < MIN_AVG_VOL_USDT):
-        return None, {
-            "atr_pct": round(atr_pct, 3), 
-            "avg_vol_usdt": int(avg_usdt), 
-            "note": "low_vol_or_range"
-        }
+    # فلترة الحجم والتقلب - صارمة
+    if atr_pct < MIN_ATR_PCT:
+        return None, {"atr_pct_low": round(atr_pct, 3)}
+    
+    if avg_usdt < MIN_AVG_VOL_USDT:
+        return None, {"avg_vol_usdt_low": int(avg_usdt)}
+    
+    # يجب أن يكون هناك انضغاط حقيقي
+    if not (BB_BANDWIDTH_MIN <= bw_now <= BB_BANDWIDTH_MAX):
+        return None, {"bw_out_of_range": round(bw_now, 5)}
+    
+    # الترند يجب أن يكون واضح
+    trend_up = e50 > e200 * 1.002  # على الأقل 0.2% فوق
+    trend_down = e50 < e200 * 0.998
+    
+    if REQUIRE_TREND and not (trend_up or trend_down):
+        return None, {"no_clear_trend": True}
 
-    # شروط Bollinger
-    squeeze_strict = bw_now <= BB_BANDWIDTH_MAX
-    squeeze_soft = bw_now <= BB_BANDWIDTH_MAX_SOFT
-    squeeze_ok = bool(squeeze_strict or (ALLOW_NO_SQUEEZE and squeeze_soft))
-
-    # اتجاهات الترند
-    trend_up = e50 > e200
-    trend_down = e50 < e200
-    trend_ok_long = (not REQUIRE_TREND) or trend_up
-    trend_ok_short = (not REQUIRE_TREND) or trend_down
-
-    # اختراقات
+    # اختراقات واضحة فقط
     crossed_up = bool((c_prev <= up_prev) and (c_now > up_now))
     crossed_down = bool((c_prev >= dn_prev) and (c_now < dn_now))
-
-    # ✨ شروط السعر المحسّنة - أكثر مرونة
-    long_price_ok = bool(
-        crossed_up or 
-        ((c_now > up_now) and (c_prev > ma20_prev)) or
-        (c_now > ma20_prev and c_now > e50)  # شرط إضافي
-    )
     
-    short_price_ok = bool(
-        crossed_down or 
-        ((c_now < dn_now) and (c_prev < ma20_prev)) or
-        (c_now < ma20_prev and c_now < e50)  # شرط إضافي
-    )
+    # تأكيد MACD
+    macd_cross_up = bool((macd_prev <= sig_prev) and (macd_now > sig_now))
+    macd_cross_down = bool((macd_prev >= sig_prev) and (macd_now < sig_now))
+    macd_bullish = macd_now > sig_now
+    macd_bearish = macd_now < sig_now
 
-    # ✨ زخم محسّن مع Stochastic
-    long_momentum = bool(
-        (macd_now > sig_now) or 
-        (c_now > e50) or
-        (stoch_k_now > stoch_d_now and stoch_k_now > 25)  # Stochastic صاعد
-    )
-    
-    short_momentum = bool(
-        (macd_now < sig_now) or 
-        (c_now < e50) or
-        (stoch_k_now < stoch_d_now and stoch_k_now < 75)  # Stochastic نازل
-    )
-
-    # RSI
-    rsi_long_ok = bool(RSI_LONG_MIN < r14 < RSI_LONG_MAX)
-    rsi_short_ok = bool(RSI_SHORT_MIN < r14 < RSI_SHORT_MAX)
-    
-    # ✨ ADX - نتأكد أن السوق فيه قوة
-    adx_ok = adx_now > 18  # ADX فوق 18 يعني فيه قوة حركة
-
-    # ✨ الشروط النهائية المحسّنة
+    # شروط LONG صارمة
     long_ok = bool(
-        squeeze_ok and 
-        long_price_ok and 
-        long_momentum and 
-        rsi_long_ok and 
-        trend_ok_long and
-        (adx_ok or volume_ratio > 1.2)  # إما ADX قوي أو حجم عالي
+        trend_up and
+        (crossed_up or (c_now > up_now and c_now > ma20_now)) and
+        (macd_bullish or macd_cross_up) and
+        (RSI_LONG_MIN < r14 < RSI_LONG_MAX) and
+        c_now > e50 and
+        volume_ratio > 0.85
     )
     
+    # شروط SHORT صارمة
     short_ok = bool(
-        squeeze_ok and 
-        short_price_ok and 
-        short_momentum and 
-        rsi_short_ok and 
-        trend_ok_short and
-        (adx_ok or volume_ratio > 1.2)
+        trend_down and
+        (crossed_down or (c_now < dn_now and c_now < ma20_now)) and
+        (macd_bearish or macd_cross_down) and
+        (RSI_SHORT_MIN < r14 < RSI_SHORT_MAX) and
+        c_now < e50 and
+        volume_ratio > 0.85
     )
 
     if not (long_ok or short_ok):
         return None, {
-            "squeeze": squeeze_ok,
-            "bw_now": round(bw_now, 5),
-            "rsi14": round(r14, 2),
-            "stoch_k": round(stoch_k_now, 2),
-            "adx": round(adx_now, 2),
-            "volume_ratio": round(volume_ratio, 2),
-            "cross_up": crossed_up,
-            "cross_down": crossed_down,
-            "macd_vs_signal": f"{round(macd_now,4)} vs {round(sig_now,4)}",
+            "bw": round(bw_now, 5),
+            "rsi": round(r14, 2),
+            "vol_ratio": round(volume_ratio, 2),
             "trend": "up" if trend_up else ("down" if trend_down else "flat"),
+            "macd_vs_sig": f"{macd_bullish}",
+            "crossed": f"up={crossed_up}, down={crossed_down}"
         }
 
     side = "LONG" if long_ok else "SHORT"
     band_now = up_now if side == "LONG" else dn_now
     
-    # ✨ حساب الثقة المحسّن
-    conf = compute_confidence_advanced(
+    # حساب الثقة الصارم
+    conf = compute_confidence_strict(
         side, bw_now, c_prev, c_now, band_now, 
         macd_now, sig_now, r14, atr_now,
-        stoch_k_now, stoch_d_now, adx_now,
-        plus_di_now, minus_di_now, volume_ratio
+        e50, e200, volume_ratio
     )
 
-    # ✨ ستوب لوس ديناميكي أذكى
+    # Stop Loss ديناميكي محسّن
     recent_lows = float(l.tail(SL_LOOKBACK).min())
     recent_highs = float(h.tail(SL_LOOKBACK).max())
     entry = c_now
-    atr_dist = ATR_SL_MULT * max(atr_now, 1e-12)
+    atr_dist = ATR_SL_MULT * atr_now
     
     if side == "LONG":
-        # ستوب لوس للشراء
         sl_atr = entry - atr_dist
-        sl_swing = recent_lows - (0.1 * atr_now)  # تحت السوينغ بقليل
-        sl_raw = max(sl_atr, sl_swing)  # نختار الأبعد للأمان
+        sl_swing = recent_lows - (0.05 * atr_now)
+        sl_raw = max(sl_atr, sl_swing)
         
         min_gap = entry * (MIN_SL_PCT / 100.0)
         max_gap = entry * (MAX_SL_PCT / 100.0)
@@ -596,10 +530,9 @@ def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         if gap > max_gap: 
             sl_raw = entry - max_gap
     else:
-        # ستوب لوس للبيع
         sl_atr = entry + atr_dist
-        sl_swing = recent_highs + (0.1 * atr_now)  # فوق السوينغ بقليل
-        sl_raw = min(sl_atr, sl_swing)  # نختار الأبعد للأمان
+        sl_swing = recent_highs + (0.05 * atr_now)
+        sl_raw = min(sl_atr, sl_swing)
         
         min_gap = entry * (MIN_SL_PCT / 100.0)
         max_gap = entry * (MAX_SL_PCT / 100.0)
@@ -612,11 +545,20 @@ def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     
     sl = float(sl_raw)
     
-    # ✨ أهداف محسّنة
+    # أهداف متدرجة واقعية
     if side == "LONG":
         tps = [entry * (1 + p/100.0) for p in TP_PCTS]
     else:
         tps = [entry * (1 - p/100.0) for p in TP_PCTS]
+    
+    # حساب R/R للتأكد من الجودة
+    risk = abs(entry - sl)
+    reward = abs(tps[2] - entry)  # نستخدم TP3
+    rr_ratio = reward / risk if risk > 0 else 0
+    
+    # رفض الإشارات بـ R/R سيء
+    if rr_ratio < 1.3:
+        return None, {"poor_rr": round(rr_ratio, 2)}
     
     return (
         {
@@ -625,9 +567,8 @@ def smart_signal_optimized(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
             "sl": sl,
             "tps": [float(x) for x in tps],
             "confidence": int(conf),
-            "adx": round(adx_now, 2),
-            "volume_ratio": round(volume_ratio, 2),
-            "stoch": round(stoch_k_now, 2)
+            "rr_ratio": round(rr_ratio, 2),
+            "volume_ratio": round(volume_ratio, 2)
         }, 
         {}
     )
@@ -681,7 +622,6 @@ def root():
 
 @app.get("/stats")
 def stats():
-    """إحصائيات سريعة عبر API"""
     return {
         "open_trades": len(open_trades),
         "cycle_count": getattr(app.state, "cycle_count", 0),
@@ -699,7 +639,7 @@ async def fetch_and_signal(ex, symbol:str):
         db_insert_error(unix_now(), ex.id, symbol, out)
         return
     
-    if out is None or len(out) < 60: 
+    if out is None or len(out) < 80: 
         db_insert_nosignal(unix_now(), ex.id, symbol, {"insufficient_data": True})
         return
 
@@ -713,7 +653,7 @@ async def fetch_and_signal(ex, symbol:str):
         return
 
     try:
-        sig, reasons = smart_signal_optimized(out)
+        sig, reasons = smart_signal_quality(out)
     except Exception as e:
         _error_bucket.append(f"{symbol}: {type(e).__name__} {str(e)}")
         return
@@ -733,30 +673,37 @@ async def fetch_and_signal(ex, symbol:str):
         db_insert_nosignal(unix_now(), ex.id, symbol, {"cycle_cap_reached": True})
         return
 
-    # ✨ رسالة محسّنة مع معلومات أكثر
+    # رسالة محسّنة
     pretty = symbol_pretty(symbol)
-    side_txt = "طويل 🟢" if sig["side"] == "LONG" else "قصير 🔴"
+    side_txt = "شراء" if sig["side"] == "LONG" else "بيع"
+    side_emoji = "🟢" if sig["side"] == "LONG" else "🔴"
     entry, sl, tps, conf = sig["entry"], sig["sl"], sig["tps"], sig["confidence"]
+    rr = sig["rr_ratio"]
     
-    # حساب نسبة المخاطرة/الربح
-    risk = abs(entry - sl)
-    reward = abs(tps[2] - entry)  # نستخدم TP3 كهدف رئيسي
-    rr_ratio = reward / risk if risk > 0 else 0
+    # تحديد قوة الإشارة
+    if conf >= 75:
+        strength = "قوية جداً"
+        strength_emoji = "🔥🔥🔥"
+    elif conf >= 68:
+        strength = "قوية"
+        strength_emoji = "🔥🔥"
+    else:
+        strength = "جيدة"
+        strength_emoji = "🔥"
     
     msg_text = (
-        f"🎯 إشارة جديدة - #{pretty}\n"
+        f"{side_emoji} إشارة {side_txt} - #{pretty}\n"
         f"{'━' * 30}\n\n"
-        f"الاتجاه: {side_txt}\n"
-        f"الثقة: {conf}% {'🔥' if conf >= 65 else '⭐' if conf >= 55 else '💫'}\n\n"
-        f"📍 نقطة الدخول: {entry:.6f}\n"
-        f"🛑 وقف الخسارة: {sl:.6f}\n\n"
-        f"🎯 الأهداف:\n"
+        f"الثقة: {conf}% {strength_emoji} ({strength})\n"
+        f"نسبة R/R: 1:{rr}\n\n"
+        f"نقطة الدخول: {entry:.6f}\n"
+        f"وقف الخسارة: {sl:.6f}\n\n"
+        f"الأهداف:\n"
         f"  TP1: {tps[0]:.6f} ({TP_PCTS[0]}%)\n"
         f"  TP2: {tps[1]:.6f} ({TP_PCTS[1]}%)\n"
-        f"  TP3: {tps[2]:.6f} ({TP_PCTS[2]}%) ⭐\n"
+        f"  TP3: {tps[2]:.6f} ({TP_PCTS[2]}%)\n"
         f"  TP4: {tps[3]:.6f} ({TP_PCTS[3]}%)\n\n"
-        f"📊 نسبة R/R: 1:{rr_ratio:.2f}\n"
-        f"📈 ADX: {sig.get('adx', 0):.1f} | Vol: {sig.get('volume_ratio', 1):.1f}x\n"
+        f"حجم التداول: {sig.get('volume_ratio', 1):.1f}x\n"
         f"{'━' * 30}"
     )
     
@@ -788,7 +735,6 @@ async def fetch_and_signal(ex, symbol:str):
         _last_cycle_alerts += 1
 
 async def check_open_trades(ex):
-    """فحص الصفقات المفتوحة وتحديث حالتها"""
     for sym, pos in list(open_trades.items()):
         price = await fetch_ticker_price(ex, sym)
         res = crossed_levels(pos["side"], price, pos["tps"], pos["sl"], pos["hit"])
@@ -806,9 +752,9 @@ async def check_open_trades(ex):
                 f"❌ #{symbol_pretty(sym)}\n"
                 f"{'━' * 25}\n"
                 f"تم ضرب وقف الخسارة\n\n"
-                f"📉 الخسارة: {round(pr, 2)}%\n"
-                f"⏰ المدة: {elapsed_text(pos['opened_ts'], ts)}\n"
-                f"💡 السعر: {price or pos['sl']:.6f}"
+                f"الخسارة: {round(pr, 2)}%\n"
+                f"المدة: {elapsed_text(pos['opened_ts'], ts)}\n"
+                f"السعر: {price or pos['sl']:.6f}"
             )
             
             send_telegram(msg)
@@ -823,17 +769,16 @@ async def check_open_trades(ex):
             tp = pos["tps"][idx]
             pr = pct_profit(pos["side"], pos["entry"], tp if price is None else price)
             
-            # رموز مختلفة حسب الهدف
-            emoji_map = ["🎯", "⭐", "🔥", "💎"]
+            emoji_map = ["✅", "⭐", "🔥", "💎"]
             emoji = emoji_map[idx] if idx < len(emoji_map) else "✅"
             
             msg = (
                 f"{emoji} #{symbol_pretty(sym)}\n"
                 f"{'━' * 25}\n"
                 f"تم الوصول إلى الهدف {idx+1}\n\n"
-                f"📈 الربح: +{round(pr, 2)}%\n"
-                f"⏰ المدة: {elapsed_text(pos['opened_ts'], ts)}\n"
-                f"💰 السعر: {price or tp:.6f}"
+                f"الربح: +{round(pr, 2)}%\n"
+                f"المدة: {elapsed_text(pos['opened_ts'], ts)}\n"
+                f"السعر: {price or tp:.6f}"
             )
             
             send_telegram(msg)
@@ -841,7 +786,6 @@ async def check_open_trades(ex):
             if pos.get("signal_id"): 
                 db_insert_outcome(pos["signal_id"], ts, f"TP{idx+1}", idx, price or tp)
             
-            # إذا كل الأهداف اتحققت، نغلق الصفقة
             if all(pos["hit"]): 
                 total_profit = sum([
                     pct_profit(pos["side"], pos["entry"], pos["tps"][i]) 
@@ -852,30 +796,26 @@ async def check_open_trades(ex):
                     f"🎉 #{symbol_pretty(sym)}\n"
                     f"{'━' * 25}\n"
                     f"تم إغلاق الصفقة بنجاح!\n\n"
-                    f"📊 متوسط الربح: +{round(total_profit, 2)}%\n"
-                    f"⏰ إجمالي المدة: {elapsed_text(pos['opened_ts'], ts)}"
+                    f"متوسط الربح: +{round(total_profit, 2)}%\n"
+                    f"إجمالي المدة: {elapsed_text(pos['opened_ts'], ts)}"
                 )
                 
                 send_telegram(final_msg)
                 del open_trades[sym]
 
 async def scan_once(ex, symbols:List[str]):
-    """دورة مسح واحدة"""
     global _last_cycle_alerts, _error_last_flush, _error_bucket
     
     _last_cycle_alerts = 0
     
-    # فحص الصفقات المفتوحة أولاً
     await check_open_trades(ex)
     
     if not symbols: 
         return
     
-    # خلط عشوائي للرموز لتوزيع الفحص
     random.shuffle(symbols)
     
-    # سيمافور للتحكم بالطلبات المتزامنة
-    sem = asyncio.Semaphore(5)  # زدنا من 3 إلى 5
+    sem = asyncio.Semaphore(4)
     
     async def worker(s):
         async with sem: 
@@ -883,17 +823,15 @@ async def scan_once(ex, symbols:List[str]):
     
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
 
-    # flush errors بشكل دوري
     now = time.time()
     if _error_bucket and (now - _error_last_flush >= ERROR_FLUSH_EVERY):
-        sample = "\n".join(_error_bucket[:8])
+        sample = "\n".join(_error_bucket[:5])
         send_telegram(f"⚠️ ملخص أخطاء ({len(_error_bucket)}):\n{sample}")
         _error_bucket.clear()
         _error_last_flush = now
 
-# ================== تقارير/أوامر محسّنة ==================
+# ================== تقارير محسّنة ==================
 def db_text_stats(days:int=1)->str:
-    """إحصائيات أساسية سريعة"""
     try:
         con = db_conn()
         cur = con.cursor()
@@ -913,7 +851,6 @@ def db_text_stats(days:int=1)->str:
         row = cur.fetchone() or (0, 0)
         tp, sl = row[0] or 0, row[1] or 0
         
-        # حساب نسبة النجاح
         if total > 0:
             success_rate = (tp / (tp + sl) * 100) if (tp + sl) > 0 else 0
         else:
@@ -925,30 +862,25 @@ def db_text_stats(days:int=1)->str:
             return "لا توجد بيانات كافية بعد."
         
         return (
-            f"📊 إحصائيات آخر {days} يوم:\n"
+            f"الإحصائيات ({days} يوم):\n"
             f"{'━' * 25}\n"
-            f"📝 إجمالي الإشارات: {total}\n"
-            f"✅ أهداف محققة: {tp}\n"
-            f"❌ ستوب لوس: {sl}\n"
-            f"📈 نسبة النجاح: {success_rate:.1f}%\n"
+            f"إجمالي الإشارات: {total}\n"
+            f"أهداف محققة: {tp}\n"
+            f"ستوب لوس: {sl}\n"
+            f"نسبة النجاح: {success_rate:.1f}%\n"
             f"{'━' * 25}"
         )
     except Exception as e:
-        return f"⚠️ خطأ الإحصائيات: {e}"
+        return f"⚠️ خطأ: {e}"
 
 def db_detailed_stats(days:int=7)->str:
-    """إحصائيات تفصيلية متقدمة للتطوير"""
     try:
         con = db_conn()
         cur = con.cursor()
         
-        # 1. إحصائيات عامة
         cur.execute("""
-            SELECT COUNT(*), 
-                   AVG(confidence),
-                   COUNT(DISTINCT symbol)
-            FROM signals 
-            WHERE ts >= strftime('%s','now', ?)
+            SELECT COUNT(*), AVG(confidence), COUNT(DISTINCT symbol)
+            FROM signals WHERE ts >= strftime('%s','now', ?)
         """, (f"-{days} day",))
         
         total_signals, avg_conf, unique_symbols = cur.fetchone()
@@ -956,11 +888,9 @@ def db_detailed_stats(days:int=7)->str:
         avg_conf = avg_conf or 0
         unique_symbols = unique_symbols or 0
         
-        # 2. تفاصيل LONG vs SHORT
         cur.execute("""
             SELECT side, COUNT(*), AVG(confidence)
-            FROM signals 
-            WHERE ts >= strftime('%s','now', ?)
+            FROM signals WHERE ts >= strftime('%s','now', ?)
             GROUP BY side
         """, (f"-{days} day",))
         
@@ -968,7 +898,6 @@ def db_detailed_stats(days:int=7)->str:
         for row in cur.fetchall():
             side_stats[row[0]] = {"count": row[1], "avg_conf": row[2] or 0}
         
-        # 3. نتائج حسب TP/SL
         cur.execute("""
             SELECT o.event, COUNT(*), AVG(s.confidence)
             FROM outcomes o
@@ -981,199 +910,43 @@ def db_detailed_stats(days:int=7)->str:
         for row in cur.fetchall():
             outcome_stats[row[0]] = {"count": row[1], "avg_conf": row[2] or 0}
         
-        # 4. أفضل وأسوأ الأزواج
-        cur.execute("""
-            SELECT s.symbol,
-                   COUNT(*) as total,
-                   SUM(CASE WHEN o.event LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN o.event = 'SL' THEN 1 ELSE 0 END) as losses
-            FROM signals s
-            LEFT JOIN outcomes o ON s.id = o.signal_id
-            WHERE s.ts >= strftime('%s','now', ?)
-            GROUP BY s.symbol
-            HAVING total >= 2
-            ORDER BY (CAST(wins AS FLOAT) / NULLIF(wins + losses, 0)) DESC
-            LIMIT 5
-        """, (f"-{days} day",))
-        
-        best_pairs = cur.fetchall()
-        
-        # 5. توزيع الثقة
-        cur.execute("""
-            SELECT 
-                CASE 
-                    WHEN confidence < 50 THEN '40-50'
-                    WHEN confidence < 55 THEN '50-55'
-                    WHEN confidence < 60 THEN '55-60'
-                    WHEN confidence < 65 THEN '60-65'
-                    WHEN confidence < 70 THEN '65-70'
-                    ELSE '70+'
-                END as conf_range,
-                COUNT(*) as count,
-                SUM(CASE WHEN o.event LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN o.event = 'SL' THEN 1 ELSE 0 END) as losses
-            FROM signals s
-            LEFT JOIN outcomes o ON s.id = o.signal_id
-            WHERE s.ts >= strftime('%s','now', ?)
-            GROUP BY conf_range
-            ORDER BY conf_range
-        """, (f"-{days} day",))
-        
-        conf_distribution = cur.fetchall()
-        
-        # 6. متوسط وقت الصفقات
-        cur.execute("""
-            SELECT AVG(o.ts - s.ts) / 60.0 as avg_minutes
-            FROM signals s
-            JOIN outcomes o ON s.id = o.signal_id
-            WHERE s.ts >= strftime('%s','now', ?)
-        """, (f"-{days} day",))
-        
-        avg_duration = cur.fetchone()[0] or 0
-        
-        # 7. أسباب عدم الإشارات (أهم 5)
-        cur.execute("""
-            SELECT reasons
-            FROM nosignal_reasons
-            WHERE ts >= strftime('%s','now', ?)
-        """, (f"-{days} day",))
-        
-        from collections import Counter
-        reason_counter = Counter()
-        for (js,) in cur.fetchall():
-            try:
-                d = json.loads(js) if isinstance(js, str) else {}
-                if isinstance(d, dict):
-                    for k in d.keys():
-                        reason_counter[k] += 1
-            except:
-                pass
-        
-        top_reasons = reason_counter.most_common(5)
-        
         con.close()
         
-        # بناء التقرير
         if total_signals == 0:
-            return "لا توجد بيانات كافية للتحليل التفصيلي."
+            return "لا توجد بيانات كافية للتحليل."
         
         output = [
-            f"📊 تقرير تحليلي متقدم ({days} يوم)",
-            "═" * 40,
+            f"تحليل متقدم ({days} يوم)",
+            "═" * 30,
             "",
-            "▶️ نظرة عامة:",
-            f"  • إجمالي الإشارات: {total_signals}",
-            f"  • متوسط الثقة: {avg_conf:.1f}%",
-            f"  • أزواج مختلفة: {unique_symbols}",
-            f"  • متوسط مدة الصفقة: {avg_duration:.0f} دقيقة",
+            "نظرة عامة:",
+            f"  إجمالي الإشارات: {total_signals}",
+            f"  متوسط الثقة: {avg_conf:.1f}%",
+            f"  أزواج مختلفة: {unique_symbols}",
             "",
-            "▶️ توزيع الاتجاهات:"
+            "توزيع الاتجاهات:"
         ]
         
         for side, data in side_stats.items():
-            output.append(f"  • {side}: {data['count']} إشارة (ثقة: {data['avg_conf']:.1f}%)")
+            output.append(f"  {side}: {data['count']} (ثقة: {data['avg_conf']:.1f}%)")
         
         output.append("")
-        output.append("▶️ النتائج حسب النوع:")
+        output.append("النتائج:")
         
         total_tp = sum(v["count"] for k, v in outcome_stats.items() if k.startswith("TP"))
         total_sl = outcome_stats.get("SL", {}).get("count", 0)
         
         if total_tp + total_sl > 0:
             win_rate = (total_tp / (total_tp + total_sl)) * 100
-            output.append(f"  • نسبة النجاح الكلية: {win_rate:.1f}%")
+            output.append(f"  نسبة النجاح: {win_rate:.1f}%")
         
         for event, data in sorted(outcome_stats.items()):
-            output.append(f"  • {event}: {data['count']} (ثقة متوسطة: {data['avg_conf']:.1f}%)")
-        
-        output.append("")
-        output.append("▶️ توزيع الثقة vs النتائج:")
-        
-        for conf_range, count, wins, losses in conf_distribution:
-            wins = wins or 0
-            losses = losses or 0
-            if wins + losses > 0:
-                wr = (wins / (wins + losses)) * 100
-                output.append(f"  • {conf_range}%: {count} إشارات → WR: {wr:.1f}%")
-            else:
-                output.append(f"  • {conf_range}%: {count} إشارات → قيد التنفيذ")
-        
-        if best_pairs:
-            output.append("")
-            output.append("▶️ أفضل 5 أزواج:")
-            for symbol, total, wins, losses in best_pairs:
-                wins = wins or 0
-                losses = losses or 0
-                if wins + losses > 0:
-                    wr = (wins / (wins + losses)) * 100
-                    output.append(f"  • {symbol_pretty(symbol)}: {wins}W/{losses}L ({wr:.0f}%)")
-        
-        if top_reasons:
-            output.append("")
-            output.append("▶️ أهم أسباب عدم الإشارة:")
-            for reason, count in top_reasons:
-                output.append(f"  • {reason}: {count}")
-        
-        output.append("")
-        output.append("═" * 40)
-        output.append("💡 استخدم هذه البيانات لضبط الإعدادات")
+            output.append(f"  {event}: {data['count']}")
         
         return "\n".join(output)
         
     except Exception as e:
-        return f"⚠️ خطأ في التحليل التفصيلي: {e}\n{traceback.format_exc()}"
-
-def db_export_analysis_csv(days:int=14)->bytes:
-    """تصدير CSV متقدم للتحليل الخارجي"""
-    con = db_conn()
-    cur = con.cursor()
-    
-    # استعلام شامل يجمع كل البيانات المهمة
-    cur.execute("""
-        SELECT 
-            s.id,
-            datetime(s.ts, 'unixepoch') as signal_time,
-            s.exchange,
-            s.symbol,
-            s.side,
-            s.entry,
-            s.sl,
-            s.tp1, s.tp2, s.tp3, s.tp4,
-            s.confidence,
-            (s.entry - s.sl) / s.entry * 100 as risk_pct,
-            (SELECT event FROM outcomes o WHERE o.signal_id = s.id ORDER BY o.ts LIMIT 1) as first_outcome,
-            (SELECT price FROM outcomes o WHERE o.signal_id = s.id ORDER BY o.ts LIMIT 1) as outcome_price,
-            (SELECT (o.ts - s.ts) / 60.0 FROM outcomes o WHERE o.signal_id = s.id ORDER BY o.ts LIMIT 1) as duration_minutes,
-            (SELECT COUNT(*) FROM outcomes o WHERE o.signal_id = s.id AND o.event LIKE 'TP%') as tp_hits,
-            CASE 
-                WHEN EXISTS(SELECT 1 FROM outcomes o WHERE o.signal_id = s.id AND o.event = 'SL') THEN 'LOSS'
-                WHEN EXISTS(SELECT 1 FROM outcomes o WHERE o.signal_id = s.id AND o.event LIKE 'TP%') THEN 'WIN'
-                ELSE 'OPEN'
-            END as status,
-            (SELECT GROUP_CONCAT(event || '@' || price, '|') FROM outcomes o WHERE o.signal_id = s.id) as all_outcomes
-        FROM signals s
-        WHERE s.ts >= strftime('%s', 'now', ?)
-        ORDER BY s.ts DESC
-    """, (f"-{days} day",))
-    
-    rows = cur.fetchall()
-    con.close()
-    
-    out = io.StringIO()
-    w = csv.writer(out)
-    
-    # Headers
-    w.writerow([
-        "ID", "Signal_Time", "Exchange", "Symbol", "Side", 
-        "Entry", "SL", "TP1", "TP2", "TP3", "TP4", 
-        "Confidence", "Risk_%", "First_Outcome", "Outcome_Price", 
-        "Duration_Minutes", "TP_Hits", "Status", "All_Outcomes"
-    ])
-    
-    for r in rows:
-        w.writerow(r)
-    
-    return out.getvalue().encode("utf-8")
+        return f"⚠️ خطأ: {e}"
 
 def db_text_reasons(window:str="1d")->str:
     unit = window[-1].lower()
@@ -1191,7 +964,7 @@ def db_text_reasons(window:str="1d")->str:
         con.close()
         
         if not rows: 
-            return "لا توجد أسباب مسجلة في هذه المدة."
+            return "لا توجد أسباب مسجلة."
         
         from collections import Counter
         cnt = Counter()
@@ -1202,25 +975,23 @@ def db_text_reasons(window:str="1d")->str:
                 if isinstance(d, dict):
                     for k in d.keys(): 
                         cnt[k] += 1
-                else: 
-                    cnt["other"] += 1
             except: 
-                cnt["other"] += 1
+                pass
         
-        lines = [f"📄 أهم الأسباب ({window}):"]
+        lines = [f"أهم الأسباب ({window}):"]
         lines.append("━" * 25)
-        lines.extend([f"{i+1}. {k}: {v}" for i, (k, v) in enumerate(cnt.most_common(10))])
+        lines.extend([f"{i+1}. {k}: {v}" for i, (k, v) in enumerate(cnt.most_common(8))])
         
         return "\n".join(lines)
     except Exception as e:
-        return f"⚠️ خطأ قراءة الأسباب: {e}"
+        return f"⚠️ خطأ: {e}"
 
 def db_text_last(limit:int=10)->str:
     try:
         con = db_conn()
         cur = con.cursor()
         cur.execute("""
-            SELECT s.id, datetime(s.ts,'unixepoch'), s.symbol, s.side, s.entry, s.sl, s.confidence,
+            SELECT s.id, datetime(s.ts,'unixepoch'), s.symbol, s.side, s.confidence,
                    (SELECT event FROM outcomes o WHERE o.signal_id=s.id ORDER BY o.ts LIMIT 1)
             FROM signals s ORDER BY s.id DESC LIMIT ?
         """, (limit,))
@@ -1230,31 +1001,31 @@ def db_text_last(limit:int=10)->str:
         if not rows: 
             return "لا توجد إشارات مسجلة بعد."
         
-        out = ["📜 آخر الإشارات:"]
-        out.append("━" * 30)
+        out = ["آخر الإشارات:"]
+        out.append("━" * 25)
         
         for r in rows:
-            result = r[7] or "قيد التنفيذ..."
+            result = r[5] or "قيد التنفيذ"
             emoji = "✅" if result and result.startswith("TP") else ("❌" if result == "SL" else "⏳")
-            out.append(f"{emoji} #{symbol_pretty(r[2])} {r[3]} | ثقة:{r[6]}% → {result}")
+            out.append(f"{emoji} #{symbol_pretty(r[2])} {r[3]} | {r[4]}% → {result}")
         
         return "\n".join(out)
     except Exception as e:
-        return f"⚠️ خطأ قراءة السجل: {e}"
+        return f"⚠️ خطأ: {e}"
 
 def db_text_open()->str:
     if not open_trades: 
-        return "لا توجد صفقات مفتوحة حالياً."
+        return "لا توجد صفقات مفتوحة."
     
-    out = ["📌 الصفقات المفتوحة:"]
-    out.append("━" * 30)
+    out = ["الصفقات المفتوحة:"]
+    out.append("━" * 25)
     
     for s, p in open_trades.items():
         hit_count = sum(p["hit"])
         out.append(
             f"#{symbol_pretty(s)} {p['side']}\n"
             f"  دخول: {p['entry']:.6f} | SL: {p['sl']:.6f}\n"
-            f"  أهداف محققة: {hit_count}/4"
+            f"  أهداف: {hit_count}/4"
         )
     
     return "\n".join(out)
@@ -1273,12 +1044,45 @@ def export_csv_bytes(days:int=14)->bytes:
     
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow([
-        "id", "ts", "exchange", "symbol", "side", "entry", "sl", 
-        "tp1", "tp2", "tp3", "tp4", "confidence", "outcomes"
-    ])
+    w.writerow(["id","ts","exchange","symbol","side","entry","sl","tp1","tp2","tp3","tp4","confidence","outcomes"])
     
     for r in rows: 
+        w.writerow(r)
+    
+    return out.getvalue().encode("utf-8")
+
+def db_export_analysis_csv(days:int=14)->bytes:
+    con = db_conn()
+    cur = con.cursor()
+    
+    cur.execute("""
+        SELECT 
+            s.id,
+            datetime(s.ts, 'unixepoch') as signal_time,
+            s.exchange, s.symbol, s.side, s.entry, s.sl,
+            s.tp1, s.tp2, s.tp3, s.tp4, s.confidence,
+            (s.entry - s.sl) / s.entry * 100 as risk_pct,
+            (SELECT event FROM outcomes o WHERE o.signal_id = s.id ORDER BY o.ts LIMIT 1) as first_outcome,
+            (SELECT price FROM outcomes o WHERE o.signal_id = s.id ORDER BY o.ts LIMIT 1) as outcome_price,
+            (SELECT (o.ts - s.ts) / 60.0 FROM outcomes o WHERE o.signal_id = s.id ORDER BY o.ts LIMIT 1) as duration_minutes,
+            CASE 
+                WHEN EXISTS(SELECT 1 FROM outcomes o WHERE o.signal_id = s.id AND o.event = 'SL') THEN 'LOSS'
+                WHEN EXISTS(SELECT 1 FROM outcomes o WHERE o.signal_id = s.id AND o.event LIKE 'TP%') THEN 'WIN'
+                ELSE 'OPEN'
+            END as status
+        FROM signals s
+        WHERE s.ts >= strftime('%s', 'now', ?)
+        ORDER BY s.ts DESC
+    """, (f"-{days} day",))
+    
+    rows = cur.fetchall()
+    con.close()
+    
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["ID","Time","Exchange","Symbol","Side","Entry","SL","TP1","TP2","TP3","TP4","Confidence","Risk%","Outcome","Price","Duration_Min","Status"])
+    
+    for r in rows:
         w.writerow(r)
     
     return out.getvalue().encode("utf-8")
@@ -1329,69 +1133,48 @@ async def poll_telegram_commands():
                     text = msg.get("text", "")
                     cmd, arg = parse_cmd(text)
 
-                    if cmd in ("/start", "🔁 تحديث القائمة"): 
+                    if cmd in ("/start", "تحديث القائمة"): 
                         send_start_menu()
-                    
-                    elif cmd in ("📊 الإحصائيات", "/stats"):
+                    elif cmd in ("الإحصائيات", "/stats"):
                         days = int(arg) if arg.isdigit() else 1
                         send_telegram(db_text_stats(days))
-                    
-                    elif cmd in ("📈 تحليل متقدم", "/analysis", "/detailed"):
+                    elif cmd in ("تحليل متقدم", "/analysis"):
                         days = int(arg) if arg.isdigit() else 7
                         send_telegram(db_detailed_stats(days))
-                    
-                    elif cmd in ("📄 الأسباب", "/reasons", "/reason"):
+                    elif cmd in ("الأسباب", "/reasons"):
                         win = arg or "1d"
                         send_telegram(db_text_reasons(win))
-                    
-                    elif cmd in ("📜 آخر الإشارات", "/last"):
+                    elif cmd in ("آخر الإشارات", "/last"):
                         lim = int(arg) if arg.isdigit() else 10
                         send_telegram(db_text_last(lim))
-                    
-                    elif cmd in ("📌 المفتوحة", "/open"): 
+                    elif cmd in ("المفتوحة", "/open"): 
                         send_telegram(db_text_open())
-                    
-                    elif cmd in ("⬇️ تصدير CSV", "/export"):
+                    elif cmd in ("تصدير CSV", "/export"):
                         days = int(arg) if arg.isdigit() else 14
-                        send_document(
-                            f"signals_{days}d.csv", 
-                            export_csv_bytes(days), 
-                            caption=f"تصدير الإشارات ({days} يوم)"
-                        )
-                    
-                    elif cmd in ("📋 تصدير تحليلي", "/export_analysis", "/analysis_csv"):
+                        send_document(f"signals_{days}d.csv", export_csv_bytes(days), caption=f"تصدير ({days} يوم)")
+                    elif cmd in ("تصدير تحليلي", "/export_analysis"):
                         days = int(arg) if arg.isdigit() else 14
-                        send_document(
-                            f"analysis_{days}d.csv",
-                            db_export_analysis_csv(days),
-                            caption=f"تصدير تحليلي شامل ({days} يوم)\nللاستخدام في Excel/Python"
-                        )
-                    
-                    elif cmd in ("/version", "نسخة", "إصدار"):
-                        send_telegram(f"🤖 الإصدار: v{APP_VERSION}")
-                    
+                        send_document(f"analysis_{days}d.csv", db_export_analysis_csv(days), caption=f"تحليل ({days} يوم)")
+                    elif cmd == "/version":
+                        send_telegram(f"الإصدار: v{APP_VERSION}")
                     else:
                         send_start_menu()
-        
         except Exception as e:
             print("poll error:", e)
-        
         await asyncio.sleep(POLL_INTERVAL)
 
 # ================== Keepalive ==================
 async def keepalive_task():
     if not KEEPALIVE_URL: 
         return
-    
     while True:
         try: 
             requests.get(KEEPALIVE_URL, timeout=10)
         except Exception as e: 
             print("keepalive error:", e)
-        
         await asyncio.sleep(max(60, KEEPALIVE_INTERVAL))
 
-# ================== Startup / Runner ==================
+# ================== Startup ==================
 app.state.exchange = None
 app.state.exchange_id = EXCHANGE_NAME
 app.state.symbols = []
@@ -1408,12 +1191,12 @@ async def _startup():
     db_init()
     
     send_telegram(
-        f"🚀 بوت التوصيات الجبار v{APP_VERSION}\n"
+        f"بوت التداول v{APP_VERSION}\n"
         f"{'━' * 30}\n"
-        f"✅ البوت يعمل الآن\n"
-        f"⏳ جاري تحميل الأسواق...\n"
-        f"📊 Timeframe: {TIMEFRAME}\n"
-        f"💪 وضع: محسّن وأقوى",
+        f"البوت يعمل الآن\n"
+        f"جاري التحميل...\n"
+        f"Timeframe: {TIMEFRAME}\n"
+        f"الوضع: جودة عالية",
         reply_markup=start_menu_markup()
     )
     
@@ -1423,16 +1206,16 @@ async def _startup():
     ex_id = app.state.exchange_id
     
     head = (
-        f"✅ التحميل اكتمل بنجاح!\n"
+        f"التحميل اكتمل!\n"
         f"{'━' * 30}\n"
-        f"📡 المنصة: {ex_id}\n"
-        f"⏱ الإطار الزمني: {TIMEFRAME}\n"
-        f"📊 عدد الأزواج: {len(syms)}\n"
-        f"🎯 الثقة الدنيا: {MIN_CONFIDENCE}%\n"
+        f"المنصة: {ex_id}\n"
+        f"الإطار الزمني: {TIMEFRAME}\n"
+        f"عدد الأزواج: {len(syms)}\n"
+        f"الثقة الدنيا: {MIN_CONFIDENCE}%\n"
         f"{'━' * 30}\n"
-        f"الأزواج المراقبة:\n"
-        f"{', '.join([symbol_pretty(s) for s in syms[:15]])}"
-        f"{f'... (+{len(syms)-15} أخرى)' if len(syms) > 15 else ''}"
+        f"الأزواج:\n"
+        f"{', '.join([symbol_pretty(s) for s in syms[:12]])}"
+        f"{f'... (+{len(syms)-12})' if len(syms) > 12 else ''}"
     )
     
     send_telegram(head)
@@ -1446,20 +1229,14 @@ async def maybe_send_no_signal_summary():
         return
     
     now = time.time()
-    ok_cycles = (NO_SIG_EVERY_N_CYCLES > 0 and 
-                 app.state.cycle_count % NO_SIG_EVERY_N_CYCLES == 0)
-    ok_minutes = (NO_SIG_EVERY_MINUTES > 0 and 
-                  (now - app.state.last_no_sig_ts) >= NO_SIG_EVERY_MINUTES * 60)
+    ok_cycles = (NO_SIG_EVERY_N_CYCLES > 0 and app.state.cycle_count % NO_SIG_EVERY_N_CYCLES == 0)
+    ok_minutes = (NO_SIG_EVERY_MINUTES > 0 and (now - app.state.last_no_sig_ts) >= NO_SIG_EVERY_MINUTES * 60)
     
     if ok_cycles or ok_minutes:
-        send_telegram(
-            "ℹ️ لا توجد فرص تداول مناسبة في الدورة الحالية.\n"
-            "البوت يراقب الأسواق باستمرار..."
-        )
+        send_telegram("لا توجد فرص مناسبة حالياً. البوت يراقب...")
         app.state.last_no_sig_ts = now
 
 async def runner():
-    """الحلقة الرئيسية للبوت"""
     while True:
         try:
             if not app.state.symbols: 
@@ -1467,43 +1244,13 @@ async def runner():
             
             await scan_once(app.state.exchange, app.state.symbols)
             app.state.cycle_count += 1
-            
             await maybe_send_no_signal_summary()
         
         except Exception as e:
-            _error_bucket.append(
-                f"Loop: {type(e).__name__} {str(e)}\n"
-                f"{traceback.format_exc().splitlines()[-1]}"
-            )
+            _error_bucket.append(f"Loop: {type(e).__name__} {str(e)}")
         
         await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-# ==========================================================
-# ✅ Keepalive route to prevent Render shutdown (for UptimeRobot)
-# ==========================================================
-try:
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse
-    import threading
-
-    _app = FastAPI()
-
-    @_app.get("/")
-    @_app.head("/")
-    async def __root_health__():
-        return JSONResponse({
-            "status": "ok",
-            "message": "Trading bot active ✅",
-        })
-
-    def __run_keepalive__():
-        import uvicorn
-        uvicorn.run(_app, host="0.0.0.0", port=10000)
-
-    threading.Thread(target=__run_keepalive__, daemon=True).start()
-
-except Exception as e:
-    print(f"[KeepAlive] ⚠️ Warning: {e}")
