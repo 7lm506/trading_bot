@@ -1,8 +1,8 @@
-# trading_bot_improved_v5.0.py
-# نسخة محسّنة: HTF(1h) + ADX + Heikin Ashi + Structure + Volume/Spike filters
-# المتطلبات: pip install ccxt fastapi uvicorn pandas requests numpy
+# trading_bot_improved_v5_1.py
+# HTF(1h) + ADX + Heikin Ashi + Structure + Volume/Spike filters
+# المتطلبات: pip install ccxt fastapi uvicorn pandas numpy requests
 
-import os, json, asyncio, time, io, csv, sqlite3, random, math, traceback
+import os, json, asyncio, time, io, csv, sqlite3, random, math
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -10,7 +10,7 @@ import requests
 import pandas as pd
 import numpy as np
 import ccxt
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -23,34 +23,28 @@ TIMEFRAME_ENV  = os.getenv("TIMEFRAME", "").strip()
 
 # ========================== [ إعدادات ] ==========================
 EXCHANGE_NAME = EXCHANGE_ENV or "okx"
-TIMEFRAME     = TIMEFRAME_ENV or "15m"   # 15m مثل القناة
+TIMEFRAME     = TIMEFRAME_ENV or "15m"
 SYMBOLS_MODE  = SYMBOLS_ENV or "ALL"
 
-# إشارات أقل لكن أذكى
 MIN_CONFIDENCE         = 60
 MIN_ATR_PCT            = 0.12
 MIN_AVG_VOL_USDT       = 150_000
 
-# RSI فقط كحدود عدم تمدد مبالغ
 RSI_LONG_MIN,  RSI_LONG_MAX  = 30, 75
 RSI_SHORT_MIN, RSI_SHORT_MAX = 25, 70
 
-# نطاق BB مرن (نسمح بلا squeeze مع شروط زخم)
 BB_BANDWIDTH_MIN_HARD  = 0.003
 BB_BANDWIDTH_MAX_HARD  = 0.08
 ALLOW_NO_SQUEEZE       = True
 
-# نطلب اتجاه على 15m + اتساق 1h
 REQUIRE_TREND          = True
 REQUIRE_HTF_ALIGNMENT  = True
 
-# سلّم أهداف ثابت مثل القناة
 TP_PCTS                = [1.0, 2.5, 4.5, 7.0]
-ATR_SL_MULT            = 0.5      # SL حول السوينغ ± 0.5*ATR
+ATR_SL_MULT            = 0.5
 SL_LOOKBACK            = 20
-MIN_SL_PCT, MAX_SL_PCT = 0.8, 2.2 # حدود بالـ%
+MIN_SL_PCT, MAX_SL_PCT = 0.8, 2.2
 
-# التشغيل الدوري
 SCAN_INTERVAL                 = 45
 MIN_SIGNAL_GAP_SEC            = 5
 MAX_ALERTS_PER_CYCLE          = 6
@@ -64,7 +58,7 @@ KEEPALIVE_URL      = os.getenv("RENDER_EXTERNAL_URL", "")
 KEEPALIVE_INTERVAL = 180
 
 BUILD_UTC     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-APP_VERSION   = f"5.0.0-HTF_ADX_HA ({BUILD_UTC})"
+APP_VERSION   = f"5.1.0-HTF_ADX_HA ({BUILD_UTC})"
 POLL_COMMANDS = True
 POLL_INTERVAL = 10
 
@@ -80,7 +74,7 @@ TG_GET_UPDATES    = TG_API + "/getUpdates"
 TG_DELETE_WEBHOOK = TG_API + "/deleteWebhook"
 
 _last_send_ts = 0
-_error_bucket = []
+_error_bucket: List[str] = []
 _error_last_flush = 0
 ERROR_FLUSH_EVERY = 300
 
@@ -116,10 +110,13 @@ def send_document(filename: str, file_bytes: bytes, caption: str="") -> bool:
         files={"document":(filename, io.BytesIO(file_bytes))}
         data={"chat_id": CHAT_ID, "caption": caption}
         r=requests.post(DOC_URL, data=data, files=files, timeout=60).json()
-        if not r.get("ok"): print("send_document error:", r); return False
+        if not r.get("ok"):
+            print("send_document error:", r)
+            return False
         return True
     except Exception as e:
-        print("send_document exception:", e); return False
+        print("send_document exception:", e)
+        return False
 
 def start_menu_markup() -> str:
     return _reply_kb([
@@ -179,9 +176,9 @@ def adx(df: pd.DataFrame, n=14) -> pd.Series:
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     ha = df.copy()
     ha["ha_close"] = (df["open"]+df["high"]+df["low"]+df["close"])/4
-    ha_open = [df["open"].iloc[0]]
+    ha_open = [float(df["open"].iloc[0])]
     for i in range(1, len(df)):
-        ha_open.append((ha_open[-1] + ha["ha_close"].iloc[i-1]) / 2)
+        ha_open.append((ha_open[-1] + float(ha["ha_close"].iloc[i-1])) / 2)
     ha["ha_open"] = pd.Series(ha_open, index=df.index)
     return ha
 
@@ -245,7 +242,7 @@ def parse_symbols(ex, val:str)->List[str]:
     if MAX_SYMBOLS>0: syms=syms[:MAX_SYMBOLS]
     return syms
 
-# ========================== [ دوال شبكة ] ==========================
+# ========================== [ شبكة ] ==========================
 async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
     for attempt in range(2):
         try:
@@ -253,7 +250,8 @@ async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
             if ex.id=="bybit": params={"category":"linear"}
             elif ex.id=="okx": params={"instType":"SWAP"}
             ohlcv=await asyncio.to_thread(ex.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, params=params)
-            if not ohlcv or len(ohlcv)<60: return None
+            if not ohlcv or len(ohlcv)<60: 
+                return None
             df=pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             if df["close"].isna().any() or (df["close"] == 0).any():
                 if attempt == 0:
@@ -263,11 +261,11 @@ async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
             df["ts"]=pd.to_datetime(df["ts"], unit="ms", utc=True)
             df.set_index("ts", inplace=True)
             return df
-        except Exception as e:
+        except Exception:
             if attempt == 0:
                 await asyncio.sleep(1)
                 continue
-            return f"خطأ: {ex.id} {type(e).__name__}"
+            return f"خطأ: {ex.id} fetch_ohlcv_failed"
     return None
 
 async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
@@ -280,7 +278,8 @@ async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
 
 async def fetch_htf(ex, symbol:str)->Optional[Tuple[float,float]]:
     out = await fetch_ohlcv_safe(ex, symbol, "1h", 400)
-    if out is None or isinstance(out,str): return None
+    if out is None or isinstance(out,str): 
+        return None
     c = out["close"]
     return float(ema(c,50).iloc[-2]), float(ema(c,200).iloc[-2])
 
@@ -311,7 +310,8 @@ def db_init():
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT, reasons TEXT);""")
     con.execute("""CREATE TABLE IF NOT EXISTS errors(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, exchange TEXT, symbol TEXT, message TEXT);""")
-    con.commit(); con.close()
+    con.commit()
+    con.close()
 
 def db_insert_signal(ts,ex,sym,side,entry,sl,tps,conf,msg_id)->int:
     con=db_conn(); cur=con.cursor()
@@ -343,7 +343,7 @@ def _f(x)->float:
         raise ValueError("invalid value")
     return v
 
-# ========================== [ ثقة/كونفيدنس ] ==========================
+# ========================== [ ثقة ] ==========================
 def compute_confidence_v2(
     side:str,
     htf_align:bool,
@@ -354,9 +354,8 @@ def compute_confidence_v2(
     rsi_val:float,
     bb_bw:float
 )->int:
-    # أوزان عملية
     w_htf = 0.35
-    w_zkhm = 0.25  # ADX/Volume
+    w_zkhm = 0.25
     w_struct = 0.20
     w_price = 0.10
     w_rsi = 0.06
@@ -365,7 +364,6 @@ def compute_confidence_v2(
     score = 0.0
     score += w_htf * (1.0 if htf_align else 0.0)
 
-    # ADX 18..35 يشبع
     adx_score = clamp((adx_now - 18.0) / (35.0 - 18.0), 0, 1)
     vol_score = clamp((volume_ratio - 1.05) / 0.5, 0, 1)
     score += w_zkhm * (0.6*adx_score + 0.4*vol_score)
@@ -375,12 +373,10 @@ def compute_confidence_v2(
 
     score += w_struct * clamp(structure_score, 0, 1)
 
-    # RSI نحو 55 للـLong و45 للـShort
     target = 55 if side=="LONG" else 45
     rsi_score = clamp(1 - abs(rsi_val - target)/25.0, 0, 1)
     score += w_rsi * rsi_score
 
-    # BB سياق فقط
     bb_score = 1.0 if (BB_BANDWIDTH_MIN_HARD <= bb_bw <= BB_BANDWIDTH_MAX_HARD) else 0.5
     score += w_bb * bb_score
 
@@ -405,22 +401,17 @@ def pct_profit(side:str, entry:float, exit_price:float)->float:
 
 def elapsed_text(start_ts:int, end_ts:int)->str:
     mins = max(0, end_ts - start_ts) // 60
-    if mins < 60: return f"{mins}د"
-    else: return f"{mins//60}س {mins%60}د"
+    return f"{mins}د" if mins < 60 else f"{mins//60}س {mins%60}د"
 
 def make_tps(side:str, entry:float)->List[float]:
-    if side=="LONG":  return [entry*(1+p/100.0) for p in TP_PCTS]
-    else:             return [entry*(1-p/100.0) for p in TP_PCTS]
+    return [entry*(1+p/100.0) for p in TP_PCTS] if side=="LONG" else [entry*(1-p/100.0) for p in TP_PCTS]
 
 def spike_or_wicky(df: pd.DataFrame, atr_now: float, volume_ratio: float) -> bool:
-    # رفض سبايكات خبرية: شمعة ذات ذيول مبالغ + حجم مجنون
-    # ننظر للشمعة المغلقة الأخيرة
     o = df["open"].iloc[-2]; h = df["high"].iloc[-2]; l = df["low"].iloc[-2]; c = df["close"].iloc[-2]
     body = abs(c - o)
     wick = (h - max(c,o)) + (min(c,o) - l)
     if volume_ratio >= 3.0 and wick > 1.2 * atr_now:
         return True
-    # فجوة غير منطقية (نادراً بالفيوتشرز لكن للاحتياط)
     gap = abs(df["open"].iloc[-1] - c)
     if gap > 1.5 * atr_now:
         return True
@@ -438,8 +429,6 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
     ema50 = ema(c, 50)
     ema200 = ema(c, 200)
     adx14 = adx(df, 14)
-
-    # Heikin Ashi
     ha = heikin_ashi(df)
 
     avg_volume = v.tail(30).mean()
@@ -450,8 +439,7 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
     try:
         c_prev = _f(c.iloc[i2]); c_now = _f(c.iloc[i1])
         up_now = _f(bb_up.iloc[i1]); dn_now = _f(bb_dn.iloc[i1])
-        bw_now = _f(bb_bw.iloc[i1])
-        r14 = _f(r.iloc[i1]); atr_now = _f(atr14.iloc[i1])
+        bw_now = _f(bb_bw.iloc[i1]); r14 = _f(r.iloc[i1]); atr_now = _f(atr14.iloc[i1])
         e50 = _f(ema50.iloc[i1]); e200 = _f(ema200.iloc[i1])
         adx_now = float(adx14.iloc[i1])
         ha_close_now = float(ha["ha_close"].iloc[i1]); ha_open_now = float(ha["ha_open"].iloc[i1])
@@ -473,18 +461,15 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
     if avg_usdt < MIN_AVG_VOL_USDT:
         return None, {"avg_vol_usdt_low": int(avg_usdt)}
 
-    # HTF (1h) alignment
     htf = await fetch_htf(ex, symbol)
     if not htf and REQUIRE_HTF_ALIGNMENT:
         return None, {"htf_missing": True}
-    htf_ok_up = htf and (htf[0] >= htf[1]*0.999)
-    htf_ok_dn = htf and (htf[0] <= htf[1]*1.001)
+    htf_ok_up = bool(htf and (htf[0] >= htf[1]*0.999))
+    htf_ok_dn = bool(htf and (htf[0] <= htf[1]*1.001))
 
-    # اتجاه 15m
     trend_up_15m  = e50 > e200
     trend_down_15m= e50 < e200
 
-    # pullback + breakout بسيط
     local_high = float(h.iloc[-3:-1].max())
     local_low  = float(l.iloc[-3:-1].min())
     pullback_ok_long  = c.iloc[i2] <= ma20_prev or c.iloc[i2] <= (up_now+dn_now)/2
@@ -492,18 +477,14 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
     breakout_long  = c_now > local_high
     breakout_short = c_now < local_low
 
-    # Heikin Ashi flip
     ha_green = ha_close_now > ha_open_now and ha_close_now > ha_close_prev
     ha_red   = ha_close_now < ha_open_now and ha_close_now < ha_close_prev
 
-    # زخم وحدّه
     zkhm_ok = (adx_now >= 18.0) and (volume_ratio >= 1.10)
 
-    # BB مرن: نرفض فقط الخانق جداً مع زخم ضعيف، أو العريض جداً بدون زخم
     if (bw_now < BB_BANDWIDTH_MIN_HARD and adx_now < 18) or (bw_now > BB_BANDWIDTH_MAX_HARD and adx_now < 22):
         return None, {"bb_bad_context": round(bw_now,5), "adx": round(adx_now,1)}
 
-    # فلترة سبايكات خبرية
     if spike_or_wicky(df, atr_now, volume_ratio):
         return None, {"spike": True}
 
@@ -531,25 +512,19 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
         }
 
     side = "LONG" if long_ok else "SHORT"
-
-    # SL حول آخر سوينغ مع ATR
     recent_lows = float(l.tail(SL_LOOKBACK).min())
     recent_highs = float(h.tail(SL_LOOKBACK).max())
     entry = float(c_now)
 
     if side == "LONG":
-        sl_swing = recent_lows - (ATR_SL_MULT * atr_now)
-        sl_raw = sl_swing
-        min_gap = entry * (MIN_SL_PCT / 100.0)
-        max_gap = entry * (MAX_SL_PCT / 100.0)
+        sl_raw = recent_lows - (ATR_SL_MULT * atr_now)
+        min_gap = entry * (MIN_SL_PCT / 100.0); max_gap = entry * (MAX_SL_PCT / 100.0)
         gap = entry - sl_raw
         if gap < min_gap: sl_raw = entry - min_gap
         if gap > max_gap: sl_raw = entry - max_gap
     else:
-        sl_swing = recent_highs + (ATR_SL_MULT * atr_now)
-        sl_raw = sl_swing
-        min_gap = entry * (MIN_SL_PCT / 100.0)
-        max_gap = entry * (MAX_SL_PCT / 100.0)
+        sl_raw = recent_highs + (ATR_SL_MULT * atr_now)
+        min_gap = entry * (MIN_SL_PCT / 100.0); max_gap = entry * (MAX_SL_PCT / 100.0)
         gap = sl_raw - entry
         if gap < min_gap: sl_raw = entry + min_gap
         if gap > max_gap: sl_raw = entry + max_gap
@@ -557,7 +532,6 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
     sl = float(sl_raw)
     tps = [float(x) for x in make_tps(side, entry)]
 
-    # RR على TP3
     risk = abs(entry - sl)
     reward = abs(tps[2] - entry)
     rr_ratio = reward / risk if risk > 0 else 0
@@ -593,7 +567,7 @@ async def smart_signal_improved(ex, symbol:str, df: pd.DataFrame) -> Tuple[Optio
         }, {}
     )
 
-# ========================== [ API + التشغيل ] ==========================
+# ========================== [ API ] ==========================
 app = FastAPI()
 
 @app.get("/")
@@ -623,13 +597,15 @@ def stats():
         "symbols_count": len(getattr(app.state, "symbols", [])),
         "exchange": getattr(app.state, "exchange_id", ""),
         "last_scan": getattr(app.state, "last_scan_time", 0)
-    })
+    }
 
+# ========================== [ دورة الإشارات ] ==========================
 async def fetch_and_signal(ex, symbol:str):
     global _last_cycle_alerts
     out = await fetch_ohlcv_safe(ex, symbol, TIMEFRAME, 360)
     if isinstance(out, str): 
-        db_insert_error(unix_now(), ex.id, symbol, out); return
+        db_insert_error(unix_now(), ex.id, symbol, out)
+        return
     if out is None or len(out) < 80: 
         return
 
@@ -704,8 +680,10 @@ async def check_open_trades(ex):
     for sym, pos in list(open_trades.items()):
         price = await fetch_ticker_price(ex, sym)
         res = crossed_levels(pos["side"], price, pos["tps"], pos["sl"], pos["hit"])
-        if not res: continue
-        kind, idx = res; ts = unix_now()
+        if not res: 
+            continue
+        kind, idx = res
+        ts = unix_now()
         if kind == "SL":
             pr = pct_profit(pos["side"], pos["entry"], price or pos["sl"])
             msg = (
@@ -742,7 +720,8 @@ async def scan_once(ex, symbols:List[str]):
     global _last_cycle_alerts, _error_last_flush, _error_bucket
     _last_cycle_alerts = 0
     await check_open_trades(ex)
-    if not symbols: return
+    if not symbols: 
+        return
     random.shuffle(symbols)
     sem = asyncio.Semaphore(6)
     async def worker(s):
@@ -836,9 +815,9 @@ def db_text_reasons(window:str="1d")->str:
                 if isinstance(d, dict):
                     for k in d.keys():
                         cnt[k] += 1
-            except: pass
-        lines = [f"أسباب ({window}):"]
-        lines.append("━" * 15)
+            except:
+                pass
+        lines = [f"أسباب ({window}):", "━" * 15]
         lines.extend([f"{i+1}. {k}: {v}" for i, (k, v) in enumerate(cnt.most_common(6))])
         return "\n".join(lines)
     except Exception as e:
@@ -854,7 +833,7 @@ def db_text_last(limit:int=10)->str:
         """, (limit,))
         rows = cur.fetchall(); con.close()
         if not rows: return "لا إشارات."
-        out = ["آخر الإشارات:"]; out.append("━" * 15)
+        out = ["آخر الإشارات:", "━" * 15]
         for r in rows:
             result = r[3] or "قيد التنفيذ"
             emoji = "✅" if result and result.startswith("TP") else ("❌" if result == "SL" else "⏳")
@@ -865,7 +844,7 @@ def db_text_last(limit:int=10)->str:
 
 def db_text_open()->str:
     if not open_trades: return "لا صفقات مفتوحة."
-    out = ["صفقات مفتوحة:"]; out.append("━" * 15)
+    out = ["صفقات مفتوحة:", "━" * 15]
     for s, p in open_trades.items():
         hit_count = sum(p["hit"])
         out.append(f"{symbol_pretty(s)} {p['side']} | أهداف: {hit_count}/4")
@@ -911,7 +890,8 @@ TG_OFFSET = 0
 def tg_delete_webhook():
     try:
         requests.post(TG_DELETE_WEBHOOK, data={"drop_pending_updates": False}, timeout=10)
-    except: pass
+    except:
+        pass
 
 def parse_cmd(text:str)->Tuple[str,str]:
     t = (text or "").strip()
@@ -934,7 +914,8 @@ async def poll_telegram_commands():
                 for upd in r.get("result", []):
                     TG_OFFSET = max(TG_OFFSET, upd["update_id"])
                     msg = upd.get("message") or upd.get("edited_message")
-                    if not msg or str(msg.get("chat", {}).get("id")) != str(CHAT_ID): continue
+                    if not msg or str(msg.get("chat", {}).get("id")) != str(CHAT_ID): 
+                        continue
                     text = msg.get("text", "")
                     cmd, arg = parse_cmd(text)
                     if cmd in ("/start", "تحديث القائمة"):
@@ -950,9 +931,9 @@ async def poll_telegram_commands():
                     elif cmd in ("المفتوحة", "/open"):
                         send_telegram(db_text_open())
                     elif cmd in ("تصدير CSV", "/export"):
-                        send_document(f"signals.csv", export_csv_bytes(int(arg) if arg.isdigit() else 14))
+                        send_document("signals.csv", export_csv_bytes(int(arg) if arg.isdigit() else 14))
                     elif cmd in ("تصدير تحليلي", "/export_analysis"):
-                        send_document(f"analysis.csv", db_export_analysis_csv(int(arg) if arg.isdigit() else 14))
+                        send_document("analysis.csv", db_export_analysis_csv(int(arg) if arg.isdigit() else 14))
                     elif cmd == "/version":
                         send_telegram(f"v{APP_VERSION}")
                     else:
