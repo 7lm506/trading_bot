@@ -1,5 +1,5 @@
-# trading_bot_balanced_v3.5.py
-# نسخة متوازنة - جودة مع كمية معقولة
+# trading_bot_improved_v4.0.py
+# نسخة محسّنة - معالجة أخطاء + keepalive + أداء أفضل
 # المتطلبات: pip install ccxt fastapi uvicorn pandas requests
 
 import os, json, asyncio, time, io, csv, sqlite3, random, math, traceback
@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 import requests
 import pandas as pd
 import ccxt
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import uvicorn
 
 # ========================== [ ENV ] ==========================
@@ -19,48 +20,43 @@ EXCHANGE_ENV   = os.getenv("EXCHANGE", "").strip().lower()
 SYMBOLS_ENV    = os.getenv("SYMBOLS", "").strip()
 TIMEFRAME_ENV  = os.getenv("TIMEFRAME", "").strip()
 
-# ========================== [ إعدادات متوازنة ] ==========================
+# ========================== [ إعدادات محسّنة ] ==========================
 EXCHANGE_NAME = EXCHANGE_ENV or "okx"
 TIMEFRAME     = TIMEFRAME_ENV or "5m"
 SYMBOLS_MODE  = SYMBOLS_ENV or "ALL"
 
-# فلترة متوازنة
-MIN_CONFIDENCE         = 55  # متوازن
-MIN_ATR_PCT            = 0.12  # تقلب معقول
-MIN_AVG_VOL_USDT       = 50_000  # سيولة معقولة
+MIN_CONFIDENCE         = 52
+MIN_ATR_PCT            = 0.11
+MIN_AVG_VOL_USDT       = 40_000
 
-# RSI
-RSI_LONG_MIN,  RSI_LONG_MAX  = 35, 70
-RSI_SHORT_MIN, RSI_SHORT_MAX = 30, 65
+RSI_LONG_MIN,  RSI_LONG_MAX  = 33, 72
+RSI_SHORT_MIN, RSI_SHORT_MAX = 28, 67
 
-# Bollinger Bands
-BB_BANDWIDTH_MAX       = 0.045
-BB_BANDWIDTH_MIN       = 0.006
+BB_BANDWIDTH_MAX       = 0.048
+BB_BANDWIDTH_MIN       = 0.005
 ALLOW_NO_SQUEEZE       = False
 
 REQUIRE_TREND          = True
 
-# أهداف وستوب
 TP_PCTS                = [0.7, 1.4, 2.2, 3.2]
-ATR_SL_MULT            = 1.9
+ATR_SL_MULT            = 1.85
 SL_LOOKBACK            = 14
 MIN_SL_PCT, MAX_SL_PCT = 0.3, 2.2
 
-# إعدادات المسح
-SCAN_INTERVAL                 = 50
-MIN_SIGNAL_GAP_SEC            = 6
-MAX_ALERTS_PER_CYCLE          = 8
-COOLDOWN_PER_SYMBOL_CANDLES   = 8
+SCAN_INTERVAL                 = 45
+MIN_SIGNAL_GAP_SEC            = 5
+MAX_ALERTS_PER_CYCLE          = 10
+COOLDOWN_PER_SYMBOL_CANDLES   = 6
 MAX_SYMBOLS                   = 120
 
 NO_SIG_EVERY_N_CYCLES         = 0
 NO_SIG_EVERY_MINUTES          = 0
 
-KEEPALIVE_URL      = ""
-KEEPALIVE_INTERVAL = 240
+KEEPALIVE_URL      = os.getenv("RENDER_EXTERNAL_URL", "")
+KEEPALIVE_INTERVAL = 180
 
 BUILD_UTC     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-APP_VERSION   = f"3.5.0-BALANCED ({BUILD_UTC})"
+APP_VERSION   = f"4.0.0-IMPROVED ({BUILD_UTC})"
 POLL_COMMANDS = True
 POLL_INTERVAL = 10
 
@@ -128,7 +124,6 @@ def start_menu_markup() -> str:
 def send_start_menu():
     send_telegram("القائمة الرئيسية:", reply_markup=start_menu_markup())
 
-# ================== المؤشرات ==================
 def ema(s: pd.Series, n:int)->pd.Series: 
     return s.ewm(span=n, adjust=False).mean()
 
@@ -162,7 +157,6 @@ def atr(df: pd.DataFrame, n=14):
 def clamp(x,a,b): 
     return max(a, min(b,x))
 
-# ================== CCXT ==================
 EXC={"bybit":ccxt.bybit,"okx":ccxt.okx,"kucoinfutures":ccxt.kucoinfutures,"bitget":ccxt.bitget,
      "gate":ccxt.gate,"binance":ccxt.binance,"krakenfutures":ccxt.krakenfutures}
 
@@ -221,26 +215,37 @@ def parse_symbols(ex, val:str)->List[str]:
         syms=syms[:MAX_SYMBOLS]
     return syms
 
-# ================== جلب البيانات ==================
 async def fetch_ohlcv_safe(ex, symbol:str, timeframe:str, limit:int):
-    try:
-        params={}
-        if ex.id=="bybit": 
-            params={"category":"linear"}
-        elif ex.id=="okx": 
-            params={"instType":"SWAP"}
-        
-        ohlcv=await asyncio.to_thread(ex.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, params=params)
-        
-        if not ohlcv or len(ohlcv)<60: 
-            return None
-        
-        df=pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["ts"]=pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df.set_index("ts", inplace=True)
-        return df
-    except Exception as e:
-        return f"خطأ: {ex.id} {type(e).__name__} {str(e)[:200]}"
+    for attempt in range(2):
+        try:
+            params={}
+            if ex.id=="bybit": 
+                params={"category":"linear"}
+            elif ex.id=="okx": 
+                params={"instType":"SWAP"}
+            
+            ohlcv=await asyncio.to_thread(ex.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, params=params)
+            
+            if not ohlcv or len(ohlcv)<60: 
+                return None
+            
+            df=pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+            
+            if df["close"].isna().any() or (df["close"] == 0).any():
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                return None
+            
+            df["ts"]=pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df.set_index("ts", inplace=True)
+            return df
+        except Exception as e:
+            if attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            return f"خطأ: {ex.id} {type(e).__name__}"
+    return None
 
 async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
     try:
@@ -250,7 +255,6 @@ async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
     except Exception: 
         return None
 
-# ================== DB ==================
 def unix_now()->int: 
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -311,14 +315,13 @@ def db_insert_error(ts,ex,sym,msg):
     con.commit()
     con.close()
 
-# ================== الاستراتيجية المتوازنة ==================
 def _f(x)->float:
     v=float(x)
-    if math.isnan(v) or math.isinf(v): 
-        raise ValueError("nan/inf")
+    if math.isnan(v) or math.isinf(v) or v < 0:
+        raise ValueError("invalid value")
     return v
 
-def compute_confidence_balanced(side:str, bw_now:float, c_now:float, 
+def compute_confidence_improved(side:str, bw_now:float, c_now:float, 
                                 band_now:float, macd_now:float, macd_sig:float, 
                                 r14:float, atr_now:float, ema50:float, ema200:float,
                                 volume_ratio:float)->int:
@@ -329,10 +332,10 @@ def compute_confidence_balanced(side:str, bw_now:float, c_now:float,
     squeeze_score = clamp((BB_BANDWIDTH_MAX - bw_now) / BB_BANDWIDTH_MAX, 0, 1)
     
     breakout_dist = abs(c_now - band_now)
-    breakout_score = clamp(breakout_dist / max(atr_now, 1e-9), 0, 1.2)
+    breakout_score = clamp(breakout_dist / max(atr_now, 1e-9), 0, 1.3)
     breakout_score = min(breakout_score, 1.0)
     
-    if breakout_score < 0.2:
+    if breakout_score < 0.18:
         return 0
     
     macd_diff = abs(macd_now - macd_sig)
@@ -340,37 +343,37 @@ def compute_confidence_balanced(side:str, bw_now:float, c_now:float,
     
     rsi_target = 55 if side == "LONG" else 45
     rsi_dev = abs(r14 - rsi_target)
-    rsi_score = clamp(1.0 - (rsi_dev / 20.0), 0, 1)
+    rsi_score = clamp(1.0 - (rsi_dev / 22.0), 0, 1)
     
     trend_strength = abs(ema50 - ema200) / max(ema200, 1e-9)
-    trend_score = clamp(trend_strength * 80, 0, 1)
+    trend_score = clamp(trend_strength * 70, 0, 1)
     
     if side == "LONG" and ema50 <= ema200:
-        trend_score *= 0.5
+        trend_score *= 0.6
     if side == "SHORT" and ema50 >= ema200:
-        trend_score *= 0.5
+        trend_score *= 0.6
     
-    volume_score = clamp((volume_ratio - 0.7) * 1.5, 0, 1)
+    volume_score = clamp((volume_ratio - 0.65) * 1.4, 0, 1)
     
-    if volume_ratio < 0.6:
+    if volume_ratio < 0.55:
         return 0
     
-    price_score = 1.0 if ((side == "LONG" and c_now > ema50) or (side == "SHORT" and c_now < ema50)) else 0.3
+    price_score = 1.0 if ((side == "LONG" and c_now > ema50) or (side == "SHORT" and c_now < ema50)) else 0.4
     
     confidence = int(round(100 * (
         0.22 * squeeze_score +
-        0.22 * breakout_score +
+        0.21 * breakout_score +
         0.15 * macd_score +
         0.13 * rsi_score +
         0.12 * trend_score +
-        0.10 * volume_score +
+        0.11 * volume_score +
         0.06 * price_score
     )))
     
     return max(0, min(100, confidence))
 
-def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
-    if df is None or len(df)<70: 
+def smart_signal_improved(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
+    if df is None or len(df)<65: 
         return None, {"insufficient_data":True}
 
     c = df["close"]
@@ -400,21 +403,19 @@ def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         bw_now = _f(bb_bw.iloc[i1])
         macd_now = _f(macd_line.iloc[i1])
         sig_now = _f(macd_sig.iloc[i1])
-        macd_prev = _f(macd_line.iloc[i2])
-        sig_prev = _f(macd_sig.iloc[i2])
         r14 = _f(r.iloc[i1])
         atr_now = _f(atr14.iloc[i1])
         e50 = _f(ema50.iloc[i1])
         e200 = _f(ema200.iloc[i1])
         ma20_now = _f(ma20.iloc[i1])
-    except Exception:
-        return None, {"index_or_nan": True}
+    except Exception as e:
+        return None, {"data_error": str(e)[:50]}
 
     atr_pct = 100 * atr_now / max(c_now, 1e-9)
     
     try:
         avg_usdt = float((df["volume"] * c).tail(30).mean())
-        if math.isnan(avg_usdt) or math.isinf(avg_usdt): 
+        if math.isnan(avg_usdt) or math.isinf(avg_usdt) or avg_usdt < 0:
             avg_usdt = 0.0
     except Exception:
         avg_usdt = 0.0
@@ -442,7 +443,7 @@ def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         (crossed_up or (c_now > up_now and c_now > ma20_now)) and
         macd_bullish and
         (RSI_LONG_MIN < r14 < RSI_LONG_MAX) and
-        volume_ratio > 0.65
+        volume_ratio > 0.6
     )
     
     short_ok = bool(
@@ -450,7 +451,7 @@ def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         (crossed_down or (c_now < dn_now and c_now < ma20_now)) and
         macd_bearish and
         (RSI_SHORT_MIN < r14 < RSI_SHORT_MAX) and
-        volume_ratio > 0.65
+        volume_ratio > 0.6
     )
 
     if not (long_ok or short_ok):
@@ -458,15 +459,13 @@ def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
             "bw": round(bw_now, 5),
             "rsi": round(r14, 2),
             "vol_ratio": round(volume_ratio, 2),
-            "trend": "up" if trend_up else ("down" if trend_down else "flat"),
-            "macd": macd_bullish,
-            "crossed": f"up={crossed_up}, down={crossed_down}"
+            "trend": "up" if trend_up else ("down" if trend_down else "flat")
         }
 
     side = "LONG" if long_ok else "SHORT"
     band_now = up_now if side == "LONG" else dn_now
     
-    conf = compute_confidence_balanced(
+    conf = compute_confidence_improved(
         side, bw_now, c_now, band_now, 
         macd_now, sig_now, r14, atr_now,
         e50, e200, volume_ratio
@@ -515,7 +514,7 @@ def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
     reward = abs(tps[2] - entry)
     rr_ratio = reward / risk if risk > 0 else 0
     
-    if rr_ratio < 1.2:
+    if rr_ratio < 1.15:
         return None, {"poor_rr": round(rr_ratio, 2)}
     
     return (
@@ -531,7 +530,6 @@ def smart_signal_balanced(df: pd.DataFrame) -> Tuple[Optional[Dict], Dict]:
         {}
     )
 
-# ================== TP/SL ==================
 def crossed_levels(side:str, price:float, tps:List[float], sl:float, hit:List[bool]):
     if price is None: 
         return None
@@ -564,19 +562,26 @@ def elapsed_text(start_ts:int, end_ts:int)->str:
     else:
         return f"{mins//60}س {mins%60}د"
 
-# ================== FastAPI ==================
 app = FastAPI()
 
 @app.get("/")
-def root():
-    return {
+@app.head("/")
+async def root():
+    return JSONResponse({
         "ok": True,
+        "status": "running",
         "version": APP_VERSION,
         "exchange": getattr(app.state, "exchange_id", EXCHANGE_NAME),
         "tf": TIMEFRAME,
         "symbols": len(getattr(app.state, "symbols", [])),
-        "open_trades": len(open_trades)
-    }
+        "open_trades": len(open_trades),
+        "uptime": int(time.time() - getattr(app.state, "start_time", time.time()))
+    })
+
+@app.get("/health")
+@app.head("/health")
+async def health():
+    return JSONResponse({"status": "healthy", "timestamp": unix_now()})
 
 @app.get("/stats")
 def stats():
@@ -585,9 +590,9 @@ def stats():
         "cycle_count": getattr(app.state, "cycle_count", 0),
         "symbols_count": len(getattr(app.state, "symbols", [])),
         "exchange": getattr(app.state, "exchange_id", ""),
+        "last_scan": getattr(app.state, "last_scan_time", 0)
     }
 
-# ================== Scan ==================
 async def fetch_and_signal(ex, symbol:str):
     global _last_cycle_alerts
     
@@ -597,7 +602,7 @@ async def fetch_and_signal(ex, symbol:str):
         db_insert_error(unix_now(), ex.id, symbol, out)
         return
     
-    if out is None or len(out) < 70: 
+    if out is None or len(out) < 65: 
         return
 
     st = signal_state.get(symbol, {})
@@ -610,7 +615,7 @@ async def fetch_and_signal(ex, symbol:str):
         return
 
     try:
-        sig, reasons = smart_signal_balanced(out)
+        sig, reasons = smart_signal_improved(out)
     except Exception as e:
         _error_bucket.append(f"{symbol}: {type(e).__name__}")
         return
@@ -634,7 +639,7 @@ async def fetch_and_signal(ex, symbol:str):
     
     if conf >= 70:
         strength_emoji = "🔥🔥"
-    elif conf >= 62:
+    elif conf >= 60:
         strength_emoji = "🔥"
     else:
         strength_emoji = "⭐"
@@ -745,13 +750,15 @@ async def scan_once(ex, symbols:List[str]):
     
     random.shuffle(symbols)
     
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(6)
     
     async def worker(s):
         async with sem: 
             await fetch_and_signal(ex, s)
     
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
+    
+    app.state.last_scan_time = unix_now()
 
     now = time.time()
     if _error_bucket and (now - _error_last_flush >= ERROR_FLUSH_EVERY):
@@ -760,7 +767,6 @@ async def scan_once(ex, symbols:List[str]):
         _error_bucket.clear()
         _error_last_flush = now
 
-# ================== تقارير ==================
 def db_text_stats(days:int=1)->str:
     try:
         con = db_conn()
@@ -830,7 +836,7 @@ def db_detailed_stats(days:int=7)->str:
             f"تحليل ({days}ي)",
             "═" * 20,
             f"إشارات: {total}",
-            f"ثقة متوسطة: {avg_conf:.1f}%",
+            f"ثقة: {avg_conf:.1f}%",
             "",
             "اتجاهات:"
         ]
@@ -972,7 +978,6 @@ def db_export_analysis_csv(days:int=14)->bytes:
     
     return out.getvalue().encode("utf-8")
 
-# ================== Telegram ==================
 TG_OFFSET = 0
 
 def tg_delete_webhook():
@@ -1041,19 +1046,25 @@ async def poll_telegram_commands():
 async def keepalive_task():
     if not KEEPALIVE_URL:
         return
+    
+    print(f"[Keepalive] Starting with URL: {KEEPALIVE_URL}")
+    
     while True:
         try:
-            requests.get(KEEPALIVE_URL, timeout=10)
-        except:
-            pass
-        await asyncio.sleep(max(60, KEEPALIVE_INTERVAL))
+            r = requests.get(KEEPALIVE_URL, timeout=10)
+            print(f"[Keepalive] Ping successful: {r.status_code}")
+        except Exception as e:
+            print(f"[Keepalive] Error: {e}")
+        
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
 
-# ================== Startup ==================
 app.state.exchange = None
 app.state.exchange_id = EXCHANGE_NAME
 app.state.symbols = []
 app.state.cycle_count = 0
 app.state.last_no_sig_ts = 0
+app.state.start_time = time.time()
+app.state.last_scan_time = 0
 
 def attempt_build():
     ex, used = try_failover(EXCHANGE_NAME)
@@ -1061,7 +1072,7 @@ def attempt_build():
     app.state.exchange, app.state.exchange_id, app.state.symbols = ex, used, syms
 
 @app.on_event("startup")
-async def _startup():
+async def startup_event():
     db_init()
     
     send_telegram(f"بوت v{APP_VERSION}\nجاري التحميل...", reply_markup=start_menu_markup())
@@ -1075,7 +1086,9 @@ async def _startup():
         f"اكتمل!\n━━━━━━━━━━━━━\n"
         f"{ex_id} | {TIMEFRAME}\n"
         f"أزواج: {len(syms)}\n"
-        f"ثقة: {MIN_CONFIDENCE}%+\n━━━━━━━━━━━━━\n"
+        f"ثقة: {MIN_CONFIDENCE}%+\n"
+        f"Cooldown: {COOLDOWN_PER_SYMBOL_CANDLES} شمعات\n"
+        f"━━━━━━━━━━━━━\n"
         f"{', '.join([symbol_pretty(s) for s in syms[:10]])}"
         f"{f'... +{len(syms)-10}' if len(syms) > 10 else ''}"
     )
@@ -1093,9 +1106,12 @@ async def runner():
             await scan_once(app.state.exchange, app.state.symbols)
             app.state.cycle_count += 1
         except Exception as e:
-            _error_bucket.append(f"{type(e).__name__}")
+            _error_bucket.append(f"{type(e).__name__}: {str(e)[:50]}")
+            print(f"[Runner Error] {e}")
+        
         await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
+    print(f"Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
