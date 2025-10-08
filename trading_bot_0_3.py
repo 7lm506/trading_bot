@@ -1,6 +1,8 @@
 # bot_v6_vwap_regime_single.py
 # Futures Signals — Regime + VWAP Bands (single file)
 # v6.0.0 — one-file build
+# ✨ Hotfix: make all network I/O non-blocking inside async tasks (keepalive + Telegram poll/send)
+#            so the server doesn't freeze and Render won't kill it.
 
 import os, asyncio, time, io, csv, json, math, random, sqlite3
 from typing import Dict, List, Optional, Tuple, Callable
@@ -151,24 +153,43 @@ def parse_cmd(text:str)->Tuple[str,str]:
         return cmd,arg
     return t,""
 
-async def poll_commands(handler:Callable[[str,str], asyncio.Future]):
-    if not POLL_COMMANDS: return
-    tg_delete_webhook()
+# ---------- NEW: non-blocking wrappers for Telegram I/O ----------
+async def tg_send_async(text: str, reply_to: Optional[int]=None, reply_markup: Optional[str]=None) -> Optional[int]:
+    return await asyncio.to_thread(tg_send, text, reply_to, reply_markup)
+
+async def tg_send_doc_async(filename: str, bytes_: bytes, caption: str="") -> bool:
+    return await asyncio.to_thread(tg_send_doc, filename, bytes_, caption)
+
+# ---------- UPDATED: polling without blocking the event-loop ----------
+async def poll_commands(handler: Callable[[str,str], asyncio.Future]):
+    if not POLL_COMMANDS: 
+        return
+    # run webhook deletion off-thread too
+    await asyncio.to_thread(tg_delete_webhook)
     global TG_OFFSET
     while True:
         try:
-            r=requests.get(GET_UPD, params={"timeout":25,"offset":TG_OFFSET+1}, timeout=35).json()
+            resp = await asyncio.to_thread(
+                requests.get,
+                GET_UPD,
+                None,
+                params={"timeout": 25, "offset": TG_OFFSET + 1},
+                timeout=35
+            )
+            r = resp.json()
             if r.get("ok"):
-                for upd in r.get("result",[]):
+                for upd in r.get("result", []):
                     TG_OFFSET=max(TG_OFFSET, upd["update_id"])
-                    msg=upd.get("message") or upd.get("edited_message")
-                    if not msg: continue
-                    if str(msg.get("chat",{}).get("id")) != str(CHAT_ID): continue
-                    text=msg.get("text","")
-                    cmd,arg = parse_cmd(text)
-                    await handler(cmd,arg)
+                    msg = upd.get("message") or upd.get("edited_message")
+                    if not msg:
+                        continue
+                    if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+                        continue
+                    text = msg.get("text", "")
+                    cmd, arg = parse_cmd(text)
+                    await handler(cmd, arg)
         except Exception as e:
-            print("[poll]",e)
+            print("[poll]", e)
         await asyncio.sleep(POLL_INTERVAL)
 
 # ============================== DB ==============================
@@ -311,7 +332,7 @@ def db_text_last(limit:int=10)->str:
 
 def export_csv_bytes(days:int=14)->bytes:
     con=db_conn(); cur=con.cursor()
-    cur.execute("""SELECT s.id,s.ts,s.exchange,s.symbol,s.side,s.entry,s.sl,
+    con.execute("""SELECT s.id,s.ts,s.exchange,s.symbol,s.side,s.entry,s.sl,
                           s.tp1,s.tp2,s.tp3,s.tp4,s.confidence,
                           (SELECT GROUP_CONCAT(event||':'||price,'|') FROM outcomes o WHERE o.signal_id=s.id)
                    FROM signals s WHERE s.ts >= strftime('%s','now', ?) ORDER BY s.id DESC""",(f"-{days} day",))
@@ -323,7 +344,7 @@ def export_csv_bytes(days:int=14)->bytes:
 
 def export_analysis_csv(days:int=14)->bytes:
     con=db_conn(); cur=con.cursor()
-    cur.execute("""SELECT s.id, datetime(s.ts,'unixepoch'), s.exchange, s.symbol, s.side,
+    con.execute("""SELECT s.id, datetime(s.ts,'unixepoch'), s.exchange, s.symbol, s.side,
                           s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.tp4, s.confidence,
                           (s.entry - s.sl)/s.entry*100 as risk_pct,
                           (SELECT event FROM outcomes o WHERE o.signal_id=s.id ORDER BY o.ts LIMIT 1),
@@ -663,7 +684,7 @@ async def fetch_and_signal(ex, symbol:str):
         f"  TP4: {tps[3]:.6f} ({TP_PCTS[3]}%)\n\n"
         f"حجم: {sig.get('volume_ratio',1):.1f}x | ADX: {sig.get('adx',0):.1f} | نظام: {sig.get('regime','?')}"
     )
-    mid = tg_send(msg)
+    mid = await tg_send_async(msg)
     if mid:
         ts=unix_now()
         open_trades[symbol]={"side":sig["side"],"entry":entry,"sl":sl,"tps":tps,"hit":[False]*4,"msg_id":mid,"signal_id":None,"opened_ts":ts}
@@ -680,7 +701,7 @@ async def check_open_trades(ex):
         kind, idx = res; ts=unix_now()
         if kind=="SL":
             pr = pct_profit(pos["side"], pos["entry"], price or pos["sl"])
-            tg_send(f"❌ #{symbol_pretty(sym)}\n━━━━━━━━━━━━━\nستوب لوس\n\nخسارة: {round(pr,2)}%\nمدة: {elapsed_text(pos['opened_ts'], ts)}")
+            await tg_send_async(f"❌ #{symbol_pretty(sym)}\n━━━━━━━━━━━━━\nستوب لوس\n\nخسارة: {round(pr,2)}%\nمدة: {elapsed_text(pos['opened_ts'], ts)}")
             if pos.get("signal_id"): db_insert_outcome(pos["signal_id"], ts, "SL", -1, price or 0.0)
             del open_trades[sym]
         else:
@@ -688,7 +709,7 @@ async def check_open_trades(ex):
             tp=pos["tps"][idx]
             pr = pct_profit(pos["side"], pos["entry"], tp if price is None else price)
             emoji=["✅","⭐","🔥","💎"][idx] if idx<4 else "✅"
-            tg_send(f"{emoji} #{symbol_pretty(sym)}\n━━━━━━━━━━━━━\nهدف {idx+1}\n\nربح: +{round(pr,2)}%\nمدة: {elapsed_text(pos['opened_ts'], ts)}")
+            await tg_send_async(f"{emoji} #{symbol_pretty(sym)}\n━━━━━━━━━━━━━\nهدف {idx+1}\n\nربح: +{round(pr,2)}%\nمدة: {elapsed_text(pos['opened_ts'], ts)}")
             if pos.get("signal_id"): db_insert_outcome(pos["signal_id"], ts, f"TP{idx+1}", idx, price or tp)
             if all(pos["hit"]): del open_trades[sym]
 
@@ -744,45 +765,49 @@ def stats():
 
 async def handle_command(cmd:str, arg:str):
     if cmd in ("/start","تحديث القائمة"):
-        tg_send("القائمة الرئيسية:", reply_markup=tg_menu_markup())
+        await tg_send_async("القائمة الرئيسية:", reply_markup=tg_menu_markup())
     elif cmd in ("الإحصائيات","/stats"):
         days=int(arg) if arg.isdigit() else 1
-        tg_send(db_text_stats(days))
+        await tg_send_async(db_text_stats(days))
     elif cmd in ("تحليل متقدم","/analysis"):
         days=int(arg) if arg.isdigit() else 7
-        tg_send(db_detailed_stats(days))
+        await tg_send_async(db_detailed_stats(days))
     elif cmd in ("الأسباب","/reasons"):
-        tg_send(db_text_reasons(arg or "1d"))
+        await tg_send_async(db_text_reasons(arg or "1d"))
     elif cmd in ("آخر الإشارات","/last"):
         limit=int(arg) if arg.isdigit() else 10
-        tg_send(db_text_last(limit))
+        await tg_send_async(db_text_last(limit))
     elif cmd in ("المفتوحة","/open"):
-        if not open_trades: tg_send("لا صفقات مفتوحة.")
+        if not open_trades: 
+            await tg_send_async("لا صفقات مفتوحة.")
         else:
             lines=["صفقات مفتوحة:","━"*15]
             for s,p in open_trades.items(): lines.append(f"{symbol_pretty(s)} {p['side']} | أهداف: {sum(p['hit'])}/4")
-            tg_send("\n".join(lines))
+            await tg_send_async("\n".join(lines))
     elif cmd in ("تصدير CSV","/export"):
         days=int(arg) if arg.isdigit() else 14
-        tg_send_doc("signals.csv", export_csv_bytes(days))
+        await tg_send_doc_async("signals.csv", export_csv_bytes(days))
     elif cmd in ("تصدير تحليلي","/export_analysis"):
         days=int(arg) if arg.isdigit() else 14
-        tg_send_doc("analysis.csv", export_analysis_csv(days))
+        await tg_send_doc_async("analysis.csv", export_analysis_csv(days))
     elif cmd=="/version":
-        tg_send(APP_VERSION)
+        await tg_send_async(APP_VERSION)
     else:
-        tg_send("القائمة الرئيسية:", reply_markup=tg_menu_markup())
+        await tg_send_async("القائمة الرئيسية:", reply_markup=tg_menu_markup())
 
+# ---------- UPDATED: keepalive without blocking ----------
 async def keepalive_task():
-    if not KEEPALIVE_URL: return
-    print(f"[Keepalive] {KEEPALIVE_URL}")
+    if not KEEPALIVE_URL: 
+        return
+    url = KEEPALIVE_URL.rstrip("/") + "/health"
+    print(f"[Keepalive] {url}")
     while True:
         try:
-            r=requests.get(KEEPALIVE_URL,timeout=10)
-            print("[Keepalive]", r.status_code)
+            resp = await asyncio.to_thread(requests.head, url, timeout=6)
+            print("[Keepalive]", resp.status_code)
         except Exception as e:
             print("[Keepalive err]", e)
-        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        await asyncio.sleep(KEEPALIVE_INTERVAL + random.randint(-10, 10))
 
 def attempt_build():
     ex, used = try_failover(EXCHANGE_NAME)
@@ -794,12 +819,12 @@ def attempt_build():
 @app.on_event("startup")
 async def startup():
     db_init()
-    tg_send(f"بوت {APP_VERSION}\nجاري التحميل...", reply_markup=tg_menu_markup())
+    await tg_send_async(f"بوت {APP_VERSION}\nجاري التحميل...", reply_markup=tg_menu_markup())
     attempt_build()
     syms=app.state.symbols; ex_id=app.state.exchange_id
     preview=", ".join([symbol_pretty(s) for s in syms[:10]])
     more=f"... +{len(syms)-10}" if len(syms)>10 else ""
-    tg_send(f"اكتمل!\n━━━━━━━━━━━━━\n{ex_id} | {TIMEFRAME}\nأزواج: {len(syms)}\nثقة: {MIN_CONFIDENCE}%+\nCooldown: {COOLDOWN_PER_SYMBOL_CANDLES} شمعات\n━━━━━━━━━━━━━\n{preview}{more}")
+    await tg_send_async(f"اكتمل!\n━━━━━━━━━━━━━\n{ex_id} | {TIMEFRAME}\nأزواج: {len(syms)}\nثقة: {MIN_CONFIDENCE}%+\nCooldown: {COOLDOWN_PER_SYMBOL_CANDLES} شمعات\n━━━━━━━━━━━━━\n{preview}{more}")
     asyncio.create_task(run_loop())
     asyncio.create_task(poll_commands(handle_command))
     asyncio.create_task(keepalive_task())
