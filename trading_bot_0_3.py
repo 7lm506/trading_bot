@@ -1,8 +1,7 @@
 # bot_v6_vwap_regime_single.py
 # Futures Signals — Regime + VWAP Bands (single file)
-# v6.0.0 — one-file build
-# ✨ Hotfix: make all network I/O non-blocking inside async tasks (keepalive + Telegram poll/send)
-#            so the server doesn't freeze and Render won't kill it.
+# v6.1.0 — Enhanced signal quality with balanced frequency
+# ✨ Improvements: Better regime detection, stricter filters, dynamic thresholds
 
 import os, asyncio, time, io, csv, json, math, random, sqlite3
 from typing import Dict, List, Optional, Tuple, Callable
@@ -25,41 +24,41 @@ SYMBOLS_VAL    = os.getenv("SYMBOLS", "ALL").strip()
 TIMEFRAME      = os.getenv("TIMEFRAME", "15m").strip()
 RENDER_URL     = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
-# Strategy params
-MIN_CONFIDENCE       = int(os.getenv("MIN_CONFIDENCE", "55"))
-MIN_ATR_PCT          = float(os.getenv("MIN_ATR_PCT", "0.12"))
-MIN_AVG_VOL_USDT     = float(os.getenv("MIN_AVG_VOL_USDT", "60000"))
+# Strategy params - ENHANCED
+MIN_CONFIDENCE       = int(os.getenv("MIN_CONFIDENCE", "68"))  # Raised from 55
+MIN_ATR_PCT          = float(os.getenv("MIN_ATR_PCT", "0.18"))  # Raised from 0.12
+MIN_AVG_VOL_USDT     = float(os.getenv("MIN_AVG_VOL_USDT", "120000"))  # Raised from 60k
 
-ADX_TRENDING_MIN     = float(os.getenv("ADX_TRENDING_MIN", "25"))
-ADX_RANGING_MAX      = float(os.getenv("ADX_RANGING_MAX", "20"))
-EMA_SLOPE_THRESHOLD  = float(os.getenv("EMA_SLOPE_THRESHOLD", "0.0015"))
+ADX_TRENDING_MIN     = float(os.getenv("ADX_TRENDING_MIN", "28"))  # Raised from 25
+ADX_RANGING_MAX      = float(os.getenv("ADX_RANGING_MAX", "23"))  # Raised from 20
+EMA_SLOPE_THRESHOLD  = float(os.getenv("EMA_SLOPE_THRESHOLD", "0.0025"))  # Raised from 0.0015
 
-VWAP_STD_MULT_1      = float(os.getenv("VWAP_STD_MULT_1", "1.0"))
-VWAP_STD_MULT_2      = float(os.getenv("VWAP_STD_MULT_2", "2.0"))
-VWAP_PERIOD          = os.getenv("VWAP_PERIOD", "session")  # placeholder anchor label
+VWAP_STD_MULT_1      = float(os.getenv("VWAP_STD_MULT_1", "1.2"))  # Raised from 1.0
+VWAP_STD_MULT_2      = float(os.getenv("VWAP_STD_MULT_2", "2.2"))  # Raised from 2.0
+VWAP_PERIOD          = os.getenv("VWAP_PERIOD", "session")
 
-REQUIRE_HTF_ALIGNMENT= os.getenv("REQUIRE_HTF_ALIGNMENT", "false").lower()=="true"
+REQUIRE_HTF_ALIGNMENT= os.getenv("REQUIRE_HTF_ALIGNMENT", "true").lower()=="true"  # Now default true
 HTF_TIMEFRAME        = os.getenv("HTF_TIMEFRAME", "1h")
-MIN_VOLUME_RATIO     = float(os.getenv("MIN_VOLUME_RATIO", "1.2"))
-MAX_EXTENDED_ATR_MULT= float(os.getenv("MAX_EXTENDED_ATR_MULT", "1.8"))
+MIN_VOLUME_RATIO     = float(os.getenv("MIN_VOLUME_RATIO", "1.5"))  # Raised from 1.2
+MAX_EXTENDED_ATR_MULT= float(os.getenv("MAX_EXTENDED_ATR_MULT", "1.5"))  # Lowered from 1.8
 
 TP_PCTS              = [
-    float(os.getenv("TP1_PCT", "1.0")),
-    float(os.getenv("TP2_PCT", "2.0")),
-    float(os.getenv("TP3_PCT", "3.5")),
-    float(os.getenv("TP4_PCT", "5.5")),
+    float(os.getenv("TP1_PCT", "1.2")),  # Raised from 1.0
+    float(os.getenv("TP2_PCT", "2.4")),  # Raised from 2.0
+    float(os.getenv("TP3_PCT", "4.0")),  # Raised from 3.5
+    float(os.getenv("TP4_PCT", "6.5")),  # Raised from 5.5
 ]
-ATR_SL_MULT          = float(os.getenv("ATR_SL_MULT", "1.5"))
-MIN_SL_PCT           = float(os.getenv("MIN_SL_PCT", "0.7"))
-MAX_SL_PCT           = float(os.getenv("MAX_SL_PCT", "2.5"))
-MIN_RR_RATIO         = float(os.getenv("MIN_RR_RATIO", "1.2"))
+ATR_SL_MULT          = float(os.getenv("ATR_SL_MULT", "1.8"))  # Raised from 1.5
+MIN_SL_PCT           = float(os.getenv("MIN_SL_PCT", "0.8"))  # Raised from 0.7
+MAX_SL_PCT           = float(os.getenv("MAX_SL_PCT", "2.2"))  # Lowered from 2.5
+MIN_RR_RATIO         = float(os.getenv("MIN_RR_RATIO", "1.8"))  # Raised from 1.2
 
-# Scan/runtime
-SCAN_INTERVAL               = int(os.getenv("SCAN_INTERVAL", "45"))
-MAX_ALERTS_PER_CYCLE        = int(os.getenv("MAX_ALERTS_PER_CYCLE", "6"))
-COOLDOWN_PER_SYMBOL_CANDLES = int(os.getenv("COOLDOWN_PER_SYMBOL_CANDLES", "8"))
-MAX_SYMBOLS                 = int(os.getenv("MAX_SYMBOLS", "120"))
-MIN_SIGNAL_GAP_SEC          = int(os.getenv("MIN_SIGNAL_GAP_SEC", "5"))
+# Scan/runtime - ADJUSTED
+SCAN_INTERVAL               = int(os.getenv("SCAN_INTERVAL", "60"))  # Raised from 45
+MAX_ALERTS_PER_CYCLE        = int(os.getenv("MAX_ALERTS_PER_CYCLE", "4"))  # Lowered from 6
+COOLDOWN_PER_SYMBOL_CANDLES = int(os.getenv("COOLDOWN_PER_SYMBOL_CANDLES", "12"))  # Raised from 8
+MAX_SYMBOLS                 = int(os.getenv("MAX_SYMBOLS", "100"))  # Lowered from 120
+MIN_SIGNAL_GAP_SEC          = int(os.getenv("MIN_SIGNAL_GAP_SEC", "8"))  # Raised from 5
 
 LOG_DB_PATH          = os.getenv("LOG_DB_PATH", "bot_stats.db")
 KEEPALIVE_URL        = RENDER_URL
@@ -67,7 +66,7 @@ KEEPALIVE_INTERVAL   = int(os.getenv("KEEPALIVE_INTERVAL", "180"))
 POLL_COMMANDS        = os.getenv("POLL_COMMANDS", "true").lower()=="true"
 POLL_INTERVAL        = int(os.getenv("POLL_INTERVAL", "10"))
 
-APP_VERSION          = f"6.0.0-VWAP-Regime ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})"
+APP_VERSION          = f"6.1.0-VWAP-Enhanced ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("ENV مفقودة: TELEGRAM_TOKEN و CHAT_ID مطلوبة.")
@@ -80,7 +79,7 @@ def clamp(x, a, b):
     return max(a, min(b, x))
 
 def symbol_pretty(s: str) -> str:
-    return s.replace(":USDT","")
+    return s.replace(":USDT","").replace(":USDC","").replace(":BTC","").replace(":USD","")
 
 def _f(x)->float:
     v=float(x)
@@ -153,18 +152,15 @@ def parse_cmd(text:str)->Tuple[str,str]:
         return cmd,arg
     return t,""
 
-# ---------- NEW: non-blocking wrappers for Telegram I/O ----------
 async def tg_send_async(text: str, reply_to: Optional[int]=None, reply_markup: Optional[str]=None) -> Optional[int]:
     return await asyncio.to_thread(tg_send, text, reply_to, reply_markup)
 
 async def tg_send_doc_async(filename: str, bytes_: bytes, caption: str="") -> bool:
     return await asyncio.to_thread(tg_send_doc, filename, bytes_, caption)
 
-# ---------- UPDATED: polling without blocking the event-loop ----------
 async def poll_commands(handler: Callable[[str,str], asyncio.Future]):
     if not POLL_COMMANDS: 
         return
-    # run webhook deletion off-thread too
     await asyncio.to_thread(tg_delete_webhook)
     global TG_OFFSET
     while True:
@@ -223,7 +219,7 @@ def db_init():
 def db_insert_signal(ts,ex,sym,side,entry,sl,tps,conf,msg_id)->int:
     con=db_conn(); cur=con.cursor()
     cur.execute("""INSERT INTO signals(ts,exchange,symbol,side,entry,sl,tp1,tp2,tp3,tp4,confidence,msg_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (ts,ex,sym,side,entry,sl,tps[0],tps[1],tps[2],tps[3],conf,msg_id))
     con.commit(); sid=cur.lastrowid; con.close(); return sid
 
@@ -485,7 +481,7 @@ async def fetch_ticker_price(ex, symbol:str)->Optional[float]:
     except Exception:
         return None
 
-# ============================== STRATEGY: VWAP + REGIME ==============================
+# ============================== STRATEGY: ENHANCED VWAP + REGIME ==============================
 async def htf_alignment_ok(ex, symbol:str, regime:str)->Optional[bool]:
     if not REQUIRE_HTF_ALIGNMENT:
         return True
@@ -493,17 +489,44 @@ async def htf_alignment_ok(ex, symbol:str, regime:str)->Optional[bool]:
     if df is None: return None
     c=df["close"]
     e50=float(ema(c,50).iloc[-2]); e200=float(ema(c,200).iloc[-2])
+    adx_htf=float(adx(df,14).iloc[-2])
+    
+    # ENHANCED: Require stronger HTF trend
     if regime=="trending":
-        return e50>e200
+        trend_ok = e50 > e200 * 1.005  # 50 EMA must be 0.5% above 200 EMA
+        strength_ok = adx_htf >= 22  # HTF must also show some trend strength
+        return trend_ok and strength_ok
     return True
 
 def detect_regime(df:pd.DataFrame, adx_now:float, atr_now:float)->str:
-    c=df["close"]
+    c["close"]
     ema200_series=ema(c,200)
+    ema50_series=ema(c,50)
+    
+    # ENHANCED: Multi-factor regime detection
     slope=(ema200_series.iloc[-1]-ema200_series.iloc[-10])/max(1e-12,abs(ema200_series.iloc[-10]))
     atr_pct = atr_now / max(c.iloc[-2],1e-12)
-    is_trending = (adx_now >= ADX_TRENDING_MIN) and (abs(slope) >= EMA_SLOPE_THRESHOLD) and (atr_pct >= 0.015)
-    return "trending" if is_trending else "ranging"
+    
+    # Check EMA separation
+    ema_separation = abs(ema50_series.iloc[-2] - ema200_series.iloc[-2]) / ema200_series.iloc[-2]
+    
+    # Multiple conditions for trending
+    strong_adx = adx_now >= ADX_TRENDING_MIN
+    strong_slope = abs(slope) >= EMA_SLOPE_THRESHOLD
+    good_volatility = atr_pct >= 0.015
+    clear_separation = ema_separation >= 0.008  # EMAs must be separated by 0.8%
+    
+    is_trending = strong_adx and strong_slope and good_volatility and clear_separation
+    
+    # For ranging, require LOW ADX
+    is_ranging = adx_now <= ADX_RANGING_MAX
+    
+    if is_trending:
+        return "trending"
+    elif is_ranging:
+        return "ranging"
+    else:
+        return "neutral"  # Neither trending nor ranging clearly
 
 def calc_sl(df, side, entry, atr_now, vwap_u1, vwap_l1)->float:
     h=df["high"]; l=df["low"]
@@ -524,33 +547,63 @@ def calc_tps(side, entry)->List[float]:
     return [entry*(1+p/100.0) for p in TP_PCTS] if side=="LONG" else [entry*(1-p/100.0) for p in TP_PCTS]
 
 def compute_confidence(side:str, regime:str, htf_ok:bool, adx_now:float, volume_ratio:float,
-                       rsi_now:float, rr_ratio:float, c_now:float, vwap_now:float, e50:float)->int:
-    # weights tuned roughly
+                       rsi_now:float, rr_ratio:float, c_now:float, vwap_now:float, e50:float,
+                       bb_squeeze:float, momentum_score:float)->int:
+    # ENHANCED weights - prioritize trend strength and momentum
     w = {
-        "htf":0.28, "trend":0.22, "vol":0.14, "rr":0.12, "rsi":0.10, "price_pos":0.08, "vwap_bias":0.06
+        "htf":0.25, "trend":0.22, "momentum":0.15, "vol":0.12, 
+        "rr":0.10, "rsi":0.08, "price_pos":0.05, "bb_squeeze":0.03
     }
     score=0.0
-    score += w["htf"]*(1.0 if (htf_ok is True) else (0.5 if htf_ok is None else 0.0))
-    trend_score = clamp((adx_now-20)/(35-20),0,1)
+    
+    # HTF alignment (critical)
+    score += w["htf"]*(1.0 if (htf_ok is True) else (0.3 if htf_ok is None else 0.0))
+    
+    # Trend strength (ADX-based)
+    if regime == "trending":
+        trend_score = clamp((adx_now-25)/(40-25),0,1)
+    else:
+        trend_score = clamp((25-adx_now)/(25-15),0,1)  # Ranging prefers lower ADX
     score += w["trend"]*trend_score
-    vol_score = clamp((volume_ratio-1.0)/0.8,0,1)
+    
+    # Momentum quality (NEW)
+    score += w["momentum"]*momentum_score
+    
+    # Volume confirmation
+    vol_score = clamp((volume_ratio-1.2)/1.0,0,1)
     score += w["vol"]*vol_score
-    rr_score = clamp((rr_ratio-1.0)/1.0,0,1)
+    
+    # Risk/Reward
+    rr_score = clamp((rr_ratio-1.5)/1.5,0,1)
     score += w["rr"]*rr_score
-    target=55 if side=="LONG" else 45
-    rsi_score=clamp(1-abs(rsi_now-target)/25.0,0,1)
+    
+    # RSI positioning
+    if regime == "trending":
+        target = 50  # Neutral RSI in trends
+        rsi_score = clamp(1-abs(rsi_now-target)/20.0,0,1)
+    else:  # Ranging mean-reversion
+        target = 65 if side=="SHORT" else 35
+        rsi_score = clamp(1-abs(rsi_now-target)/15.0,0,1)
     score += w["rsi"]*rsi_score
+    
+    # Price position relative to EMA
     price_pos = (c_now/e50-1) if side=="LONG" else (1-c_now/e50)
-    score += w["price_pos"]*clamp(price_pos,0,1)
-    vwap_bias = (c_now/vwap_now-1) if side=="LONG" else (1-c_now/vwap_now)
-    score += w["vwap_bias"]*clamp(vwap_bias,0,1)
-    return int(round(score*100))
+    score += w["price_pos"]*clamp(price_pos*100,0,1)
+    
+    # Bollinger squeeze (volatility compression before expansion)
+    score += w["bb_squeeze"]*bb_squeeze
+    
+    return int(round(clamp(score*100, 0, 100)))
 
 async def analyze_signal(ex, symbol:str, df:pd.DataFrame)->Tuple[Optional[Dict],Dict]:
-    if df is None or len(df)<80: return None, {"insufficient_data":True}
-    c=df["close"]; h=df["high"]; l=df["low"]; v=df["volume"]
-    ema50_s=ema(c,50); ema200_s=ema(c,200)
+    if df is None or len(df)<100: return None, {"insufficient_data":True}
+    c=df["close"]; h=df["high"]; l=df["low"]; v=df["volume"]; o=df["open"]
+    
+    # Calculate all indicators
+    ema50_s=ema(c,50); ema200_s=ema(c,200); ema20_s=ema(c,20)
     atr14=atr(df,14); adx14=adx(df,14); rsi14=rsi(c,14)
+    bb_mid, bb_up, bb_dn, bb_width = bollinger(c, 20, 2.0)
+    
     vwap, vstd, tp=vwap_anchored(df, VWAP_PERIOD)
     v_u1=vwap + VWAP_STD_MULT_1*vstd
     v_l1=vwap - VWAP_STD_MULT_1*vstd
@@ -559,71 +612,184 @@ async def analyze_signal(ex, symbol:str, df:pd.DataFrame)->Tuple[Optional[Dict],
 
     i=-2
     try:
-        c_now=_f(c.iloc[i]); atr_now=_f(atr14.iloc[i]); adx_now=float(adx14.iloc[i]); rsi_now=float(rsi14.iloc[i])
-        e50=_f(ema50_s.iloc[i]); e200=_f(ema200_s.iloc[i])
-        vwap_now=float(vwap.iloc[i]); vu1=float(v_u1.iloc[i]); vl1=float(v_l1.iloc[i]); vu2=float(v_u2.iloc[i]); vl2=float(v_l2.iloc[i])
+        c_now=_f(c.iloc[i]); o_now=_f(o.iloc[i])
+        atr_now=_f(atr14.iloc[i]); adx_now=float(adx14.iloc[i]); rsi_now=float(rsi14.iloc[i])
+        e50=_f(ema50_s.iloc[i]); e200=_f(ema200_s.iloc[i]); e20=_f(ema20_s.iloc[i])
+        vwap_now=float(vwap.iloc[i])
+        vu1=float(v_u1.iloc[i]); vl1=float(v_l1.iloc[i])
+        vu2=float(v_u2.iloc[i]); vl2=float(v_l2.iloc[i])
+        bb_w=float(bb_width.iloc[i])
+        bb_mid_now=float(bb_mid.iloc[i])
     except Exception as e:
         return None, {"data_error":str(e)[:50]}
 
+    # ENHANCED: Liquidity filter
     avg_usdt=float((v*c).tail(30).mean())
     if avg_usdt < MIN_AVG_VOL_USDT:
         return None, {"low_liquidity":int(avg_usdt), "th":MIN_AVG_VOL_USDT}
+    
+    # ENHANCED: Volatility filter
     atr_pct=100*atr_now/max(c_now,1e-9)
     if atr_pct < MIN_ATR_PCT:
-        return None, {"atr_pct_low":round(atr_pct,3)}
+        return None, {"atr_pct_low":round(atr_pct,3), "min":MIN_ATR_PCT}
 
+    # Detect regime
     regime=detect_regime(df, adx_now, atr_now)
+    if regime == "neutral":
+        return None, {"regime_unclear":"neutral", "adx":round(adx_now,1)}
+    
+    # HTF alignment check
     htf_ok = await htf_alignment_ok(ex, symbol, regime)
+    if REQUIRE_HTF_ALIGNMENT and htf_ok is False:
+        return None, {"htf_misaligned":True}
     if REQUIRE_HTF_ALIGNMENT and htf_ok is None:
         return None, {"htf_missing":True}
 
-    # extended candle filter
-    body=abs(df["close"].iloc[i]-df["open"].iloc[i])
+    # ENHANCED: Extended candle filter
+    body=abs(c_now-o_now)
+    candle_range=abs(h.iloc[i]-l.iloc[i])
     if body > MAX_EXTENDED_ATR_MULT*atr_now:
-        return None, {"extended_candle":True}
+        return None, {"extended_candle":round(body/atr_now,2)}
+    
+    # Wick ratio check (avoid candles with huge wicks)
+    if candle_range > 0:
+        wick_ratio = body / candle_range
+        if wick_ratio < 0.4:  # Body must be at least 40% of total range
+            return None, {"weak_body":round(wick_ratio,2)}
 
+    # Volume analysis
     volume_ratio=float(v.iloc[i]/max(v.tail(30).mean(),1e-9))
+    volume_trend = float(v.tail(5).mean() / v.tail(20).mean())
+    
+    # ENHANCED: Momentum scoring
+    momentum_score = 0.0
+    price_vs_ema20 = (c_now - e20) / e20
+    ema_alignment = (e20 > e50 > e200) if c_now > e20 else (e20 < e50 < e200)
+    if ema_alignment:
+        momentum_score += 0.4
+    momentum_score += clamp(abs(price_vs_ema20)*50, 0, 0.3)
+    momentum_score += clamp((volume_trend-1)*2, 0, 0.3)
+    momentum_score = clamp(momentum_score, 0, 1)
+    
+    # Bollinger squeeze detection (volatility compression)
+    bb_squeeze = clamp(1 - bb_w*5, 0, 1)  # Higher when bands are tight
 
     side=None
+    entry_reason=""
+    
     if regime=="trending":
-        if e50>e200:
+        # ENHANCED trending logic
+        if e50 > e200 * 1.003:  # Clear uptrend (50 EMA at least 0.3% above 200)
+            # Look for pullback to VWAP lower band
             touched_lower = (l.iloc[i] <= vl1 and c_now >= vl1)
-            if not touched_lower: return None, {"no_pullback_to_vwap_band":"lower","regime":regime}
-            if volume_ratio < MIN_VOLUME_RATIO: return None, {"volume_ratio_low":round(volume_ratio,2),"regime":regime}
-            if 30 <= rsi_now <= 70: side="LONG"
-            else: return None, {"rsi":round(rsi_now,1)}
-        elif e50<e200:
-            touched_upper = (h.iloc[i] >= vu1 and c_now <= vu1)
-            if not touched_upper: return None, {"no_pullback_to_vwap_band":"upper","regime":regime}
-            if volume_ratio < MIN_VOLUME_RATIO: return None, {"volume_ratio_low":round(volume_ratio,2),"regime":regime}
-            if 30 <= rsi_now <= 70: side="SHORT"
-            else: return None, {"rsi":round(rsi_now,1)}
-        else:
-            return None, {"no_clear_trend":True}
-    else: # ranging mean-reversion
-        if (c_now <= vl2 and rsi_now < 35) and (volume_ratio >= MIN_VOLUME_RATIO):
+            close_to_vwap = abs(c_now - vwap_now) / vwap_now < 0.015  # Within 1.5% of VWAP
+            
+            if not (touched_lower or close_to_vwap):
+                return None, {"no_pullback":"trend_up","dist_from_vwap":round((c_now/vwap_now-1)*100,2)}
+            
+            # Volume must confirm
+            if volume_ratio < MIN_VOLUME_RATIO:
+                return None, {"volume_ratio_low":round(volume_ratio,2),"min":MIN_VOLUME_RATIO}
+            
+            # RSI check - not overbought, preferably neutral or slightly oversold
+            if rsi_now > 65:
+                return None, {"rsi_high":round(rsi_now,1)}
+            if rsi_now < 35:  # Too oversold might mean reversal
+                return None, {"rsi_too_low":round(rsi_now,1)}
+            
+            # Price must be above EMA20 or very close
+            if c_now < e20 * 0.995:
+                return None, {"below_ema20":True}
+            
             side="LONG"
-        elif (c_now >= vu2 and rsi_now > 65) and (volume_ratio >= MIN_VOLUME_RATIO):
+            entry_reason="trend_pullback"
+            
+        elif e50 < e200 * 0.997:  # Clear downtrend
+            touched_upper = (h.iloc[i] >= vu1 and c_now <= vu1)
+            close_to_vwap = abs(c_now - vwap_now) / vwap_now < 0.015
+            
+            if not (touched_upper or close_to_vwap):
+                return None, {"no_pullback":"trend_down","dist_from_vwap":round((1-c_now/vwap_now)*100,2)}
+            
+            if volume_ratio < MIN_VOLUME_RATIO:
+                return None, {"volume_ratio_low":round(volume_ratio,2)}
+            
+            if rsi_now < 35:
+                return None, {"rsi_low":round(rsi_now,1)}
+            if rsi_now > 65:
+                return None, {"rsi_too_high":round(rsi_now,1)}
+            
+            if c_now > e20 * 1.005:
+                return None, {"above_ema20":True}
+            
             side="SHORT"
+            entry_reason="trend_pullback"
         else:
-            return None, {"range_no_extreme":True, "vol_ratio":round(volume_ratio,2)}
+            return None, {"no_clear_trend":"ema_mixed"}
+            
+    else:  # ranging mean-reversion
+        # ENHANCED ranging logic - stricter extremes
+        if (c_now <= vl2 and rsi_now < 32):  # More extreme oversold
+            if volume_ratio < MIN_VOLUME_RATIO:
+                return None, {"volume_low_ranging":round(volume_ratio,2)}
+            
+            # Check for bullish reversal signs
+            bullish_candle = c_now > o_now
+            hammer_like = (c_now - l.iloc[i]) < body * 0.5  # Small lower wick
+            
+            if not bullish_candle:
+                return None, {"no_bullish_candle":True}
+            
+            side="LONG"
+            entry_reason="range_bounce"
+            
+        elif (c_now >= vu2 and rsi_now > 68):  # More extreme overbought
+            if volume_ratio < MIN_VOLUME_RATIO:
+                return None, {"volume_low_ranging":round(volume_ratio,2)}
+            
+            bearish_candle = c_now < o_now
+            shooting_star = (h.iloc[i] - c_now) < body * 0.5
+            
+            if not bearish_candle:
+                return None, {"no_bearish_candle":True}
+            
+            side="SHORT"
+            entry_reason="range_bounce"
+        else:
+            return None, {"range_no_extreme":True, "c_vs_vl2":round((c_now/vl2-1)*100,2), "c_vs_vu2":round((1-c_now/vu2)*100,2)}
 
+    # Calculate levels
     entry=float(c_now)
     sl=calc_sl(df, side, entry, atr_now, vu1, vl1)
     tps=[float(x) for x in calc_tps(side, entry)]
+    
+    # Risk/Reward check
     risk=abs(entry-sl); reward=abs(tps[2]-entry); rr= reward/risk if risk>0 else 0
     if rr < MIN_RR_RATIO:
         return None, {"rr_low":round(rr,2),"min":MIN_RR_RATIO}
-
-    conf=compute_confidence(side, regime, htf_ok if htf_ok is not None else False, adx_now, volume_ratio,
-                            rsi_now, rr, c_now, vwap_now, e50)
+    
+    # ENHANCED confidence calculation
+    conf=compute_confidence(
+        side, regime, htf_ok if htf_ok is not None else False,
+        adx_now, volume_ratio, rsi_now, rr, c_now, vwap_now, e50,
+        bb_squeeze, momentum_score
+    )
+    
     if conf < MIN_CONFIDENCE:
         return None, {"conf_low":conf,"min":MIN_CONFIDENCE}
 
     return {
-        "side": side, "entry": entry, "sl": float(sl), "tps": tps,
-        "confidence": int(conf), "rr_ratio": round(rr,2),
-        "volume_ratio": round(volume_ratio,2), "adx": round(adx_now,1), "regime": regime
+        "side": side,
+        "entry": entry,
+        "sl": float(sl),
+        "tps": tps,
+        "confidence": int(conf),
+        "rr_ratio": round(rr,2),
+        "volume_ratio": round(volume_ratio,2),
+        "adx": round(adx_now,1),
+        "regime": regime,
+        "entry_reason": entry_reason,
+        "momentum": round(momentum_score,2)
     }, {}
 
 # ============================== ENGINE ==============================
@@ -650,44 +816,65 @@ def elapsed_text(start_ts:int, end_ts:int)->str:
 
 async def fetch_and_signal(ex, symbol:str):
     global _last_cycle_alerts
-    df=await fetch_ohlcv_safe(ex, symbol, TIMEFRAME, 360)
-    if df is None or len(df)<80: return
+    df=await fetch_ohlcv_safe(ex, symbol, TIMEFRAME, 400)  # More data for better analysis
+    if df is None or len(df)<100: return
+    
     st=signal_state.get(symbol,{})
     closed_idx=len(df)-2
     if closed_idx < st.get("cooldown_until_idx",-999999): return
     if symbol in open_trades: return
+    
     try:
         sig, reasons = await analyze_signal(ex, symbol, df)
     except Exception as e:
         db_insert_error(unix_now(), ex.id, symbol, f"analyze:{type(e).__name__}")
         return
+    
     if not sig:
         db_insert_nosignal(unix_now(), ex.id, symbol, reasons or {})
         return
+    
     if _last_cycle_alerts >= MAX_ALERTS_PER_CYCLE: return
 
     side_txt = "شراء" if sig["side"]=="LONG" else "بيع"
     side_emoji = "🟢" if sig["side"]=="LONG" else "🔴"
     entry, sl, tps, conf, rr = sig["entry"], sig["sl"], sig["tps"], sig["confidence"], sig["rr_ratio"]
-    strength = "🔥🔥" if conf>=70 else ("🔥" if conf>=60 else "⭐")
+    
+    # ENHANCED emoji based on confidence
+    if conf >= 75:
+        strength = "🔥🔥🔥"
+    elif conf >= 70:
+        strength = "🔥🔥"
+    elif conf >= 65:
+        strength = "🔥"
+    else:
+        strength = "⭐"
+    
     pretty = symbol_pretty(symbol)
+    regime_ar = "ترند" if sig.get("regime")=="trending" else "رينج"
+    
     msg = (
         f"{side_emoji} {side_txt} - #{pretty}\n"
         f"━━━━━━━━━━━━━━━━━\n\n"
-        f"ثقة: {conf}% {strength} | R/R: 1:{rr}\n\n"
+        f"ثقة: {conf}% {strength} | R/R: 1:{rr}\n"
+        f"نظام: {regime_ar} | ADX: {sig.get('adx',0):.1f}\n\n"
         f"دخول: {entry:.6f}\n"
         f"ستوب: {sl:.6f}\n\n"
         f"أهداف:\n"
-        f"  TP1: {tps[0]:.6f} ({TP_PCTS[0]}%)\n"
-        f"  TP2: {tps[1]:.6f} ({TP_PCTS[1]}%)\n"
-        f"  TP3: {tps[2]:.6f} ({TP_PCTS[2]}%)\n"
-        f"  TP4: {tps[3]:.6f} ({TP_PCTS[3]}%)\n\n"
-        f"حجم: {sig.get('volume_ratio',1):.1f}x | ADX: {sig.get('adx',0):.1f} | نظام: {sig.get('regime','?')}"
+        f"  TP1: {tps[0]:.6f} ({TP_PCTS[0]:.1f}%)\n"
+        f"  TP2: {tps[1]:.6f} ({TP_PCTS[1]:.1f}%)\n"
+        f"  TP3: {tps[2]:.6f} ({TP_PCTS[2]:.1f}%)\n"
+        f"  TP4: {tps[3]:.6f} ({TP_PCTS[3]:.1f}%)\n\n"
+        f"حجم: {sig.get('volume_ratio',1):.1f}x | زخم: {sig.get('momentum',0):.2f}"
     )
+    
     mid = await tg_send_async(msg)
     if mid:
         ts=unix_now()
-        open_trades[symbol]={"side":sig["side"],"entry":entry,"sl":sl,"tps":tps,"hit":[False]*4,"msg_id":mid,"signal_id":None,"opened_ts":ts}
+        open_trades[symbol]={
+            "side":sig["side"],"entry":entry,"sl":sl,"tps":tps,
+            "hit":[False]*4,"msg_id":mid,"signal_id":None,"opened_ts":ts
+        }
         signal_state[symbol]={"cooldown_until_idx":closed_idx+COOLDOWN_PER_SYMBOL_CANDLES}
         sid=db_insert_signal(ts, ex.id, symbol, sig["side"], entry, sl, tps, conf, mid)
         open_trades[symbol]["signal_id"]=sid
@@ -701,17 +888,32 @@ async def check_open_trades(ex):
         kind, idx = res; ts=unix_now()
         if kind=="SL":
             pr = pct_profit(pos["side"], pos["entry"], price or pos["sl"])
-            await tg_send_async(f"❌ #{symbol_pretty(sym)}\n━━━━━━━━━━━━━\nستوب لوس\n\nخسارة: {round(pr,2)}%\nمدة: {elapsed_text(pos['opened_ts'], ts)}")
-            if pos.get("signal_id"): db_insert_outcome(pos["signal_id"], ts, "SL", -1, price or 0.0)
+            await tg_send_async(
+                f"❌ #{symbol_pretty(sym)}\n"
+                f"━━━━━━━━━━━━━\n"
+                f"ستوب لوس\n\n"
+                f"خسارة: {round(pr,2)}%\n"
+                f"مدة: {elapsed_text(pos['opened_ts'], ts)}"
+            )
+            if pos.get("signal_id"): 
+                db_insert_outcome(pos["signal_id"], ts, "SL", -1, price or 0.0)
             del open_trades[sym]
         else:
             pos["hit"][idx]=True
             tp=pos["tps"][idx]
             pr = pct_profit(pos["side"], pos["entry"], tp if price is None else price)
             emoji=["✅","⭐","🔥","💎"][idx] if idx<4 else "✅"
-            await tg_send_async(f"{emoji} #{symbol_pretty(sym)}\n━━━━━━━━━━━━━\nهدف {idx+1}\n\nربح: +{round(pr,2)}%\nمدة: {elapsed_text(pos['opened_ts'], ts)}")
-            if pos.get("signal_id"): db_insert_outcome(pos["signal_id"], ts, f"TP{idx+1}", idx, price or tp)
-            if all(pos["hit"]): del open_trades[sym]
+            await tg_send_async(
+                f"{emoji} #{symbol_pretty(sym)}\n"
+                f"━━━━━━━━━━━━━\n"
+                f"هدف {idx+1}\n\n"
+                f"ربح: +{round(pr,2)}%\n"
+                f"مدة: {elapsed_text(pos['opened_ts'], ts)}"
+            )
+            if pos.get("signal_id"): 
+                db_insert_outcome(pos["signal_id"], ts, f"TP{idx+1}", idx, price or tp)
+            if all(pos["hit"]): 
+                del open_trades[sym]
 
 async def scan_cycle(ex, symbols:List[str]):
     global _last_cycle_alerts
@@ -719,14 +921,14 @@ async def scan_cycle(ex, symbols:List[str]):
     await check_open_trades(ex)
     if not symbols: return
     random.shuffle(symbols)
-    sem=asyncio.Semaphore(6)
+    sem=asyncio.Semaphore(5)  # Reduced from 6 for stability
     async def worker(s):
         async with sem:
             await fetch_and_signal(ex, s)
-    await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols])
+    await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols], return_exceptions=True)
 
 # ============================== FASTAPI + STARTUP ==============================
-app = FastAPI(title="Futures Signal Engine", version="6.0.0")
+app = FastAPI(title="Futures Signal Engine Enhanced", version="6.1.0")
 app.state.exchange=None
 app.state.exchange_id=EXCHANGE_NAME
 app.state.symbols=[]
@@ -745,7 +947,9 @@ async def root():
         "timeframe": TIMEFRAME,
         "symbols": len(getattr(app.state,"symbols",[])),
         "open_trades": len(open_trades),
-        "uptime": unix_now()-app.state.start_time
+        "uptime": unix_now()-app.state.start_time,
+        "min_confidence": MIN_CONFIDENCE,
+        "min_atr_pct": MIN_ATR_PCT
     }
 
 @app.get("/health")
@@ -782,7 +986,8 @@ async def handle_command(cmd:str, arg:str):
             await tg_send_async("لا صفقات مفتوحة.")
         else:
             lines=["صفقات مفتوحة:","━"*15]
-            for s,p in open_trades.items(): lines.append(f"{symbol_pretty(s)} {p['side']} | أهداف: {sum(p['hit'])}/4")
+            for s,p in open_trades.items(): 
+                lines.append(f"{symbol_pretty(s)} {p['side']} | أهداف: {sum(p['hit'])}/4")
             await tg_send_async("\n".join(lines))
     elif cmd in ("تصدير CSV","/export"):
         days=int(arg) if arg.isdigit() else 14
@@ -795,7 +1000,6 @@ async def handle_command(cmd:str, arg:str):
     else:
         await tg_send_async("القائمة الرئيسية:", reply_markup=tg_menu_markup())
 
-# ---------- UPDATED: keepalive without blocking ----------
 async def keepalive_task():
     if not KEEPALIVE_URL: 
         return
@@ -819,12 +1023,28 @@ def attempt_build():
 @app.on_event("startup")
 async def startup():
     db_init()
-    await tg_send_async(f"بوت {APP_VERSION}\nجاري التحميل...", reply_markup=tg_menu_markup())
+    await tg_send_async(
+        f"بوت {APP_VERSION}\n━━━━━━━━━━━━━\n"
+        f"جاري التحميل...\n\n"
+        f"✨ تحسينات الجودة\n"
+        f"• ثقة دنيا: {MIN_CONFIDENCE}%\n"
+        f"• ATR دنيا: {MIN_ATR_PCT}%\n"
+        f"• R/R دنيا: {MIN_RR_RATIO}:1",
+        reply_markup=tg_menu_markup()
+    )
     attempt_build()
     syms=app.state.symbols; ex_id=app.state.exchange_id
-    preview=", ".join([symbol_pretty(s) for s in syms[:10]])
-    more=f"... +{len(syms)-10}" if len(syms)>10 else ""
-    await tg_send_async(f"اكتمل!\n━━━━━━━━━━━━━\n{ex_id} | {TIMEFRAME}\nأزواج: {len(syms)}\nثقة: {MIN_CONFIDENCE}%+\nCooldown: {COOLDOWN_PER_SYMBOL_CANDLES} شمعات\n━━━━━━━━━━━━━\n{preview}{more}")
+    preview=", ".join([symbol_pretty(s) for s in syms[:8]])
+    more=f"... +{len(syms)-8}" if len(syms)>8 else ""
+    await tg_send_async(
+        f"✅ اكتمل!\n"
+        f"━━━━━━━━━━━━━\n"
+        f"{ex_id} | {TIMEFRAME}\n"
+        f"أزواج: {len(syms)}\n"
+        f"Cooldown: {COOLDOWN_PER_SYMBOL_CANDLES} شمعة\n"
+        f"━━━━━━━━━━━━━\n"
+        f"{preview}{more}"
+    )
     asyncio.create_task(run_loop())
     asyncio.create_task(poll_commands(handle_command))
     asyncio.create_task(keepalive_task())
@@ -842,5 +1062,5 @@ async def run_loop():
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","10000"))
-    print(f"Starting server on {port} …")
+    print(f"Starting Enhanced Signal Engine on port {port} …")
     uvicorn.run(app, host="0.0.0.0", port=port)
