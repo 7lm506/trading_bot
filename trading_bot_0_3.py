@@ -1,6 +1,6 @@
 # bot_v6_vwap_regime_single.py
 # Futures Signals — Regime + VWAP Bands (single file)
-# v6.1.0 — Enhanced signal quality with balanced frequency
+# v6.1.1 — Enhanced signal quality with balanced frequency + bugfixes
 # ✨ Improvements: Better regime detection, stricter filters, dynamic thresholds
 
 import os, asyncio, time, io, csv, json, math, random, sqlite3
@@ -66,7 +66,7 @@ KEEPALIVE_INTERVAL   = int(os.getenv("KEEPALIVE_INTERVAL", "180"))
 POLL_COMMANDS        = os.getenv("POLL_COMMANDS", "true").lower()=="true"
 POLL_INTERVAL        = int(os.getenv("POLL_INTERVAL", "10"))
 
-APP_VERSION          = f"6.1.0-VWAP-Enhanced ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})"
+APP_VERSION          = f"6.1.1-VWAP-Enhanced ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise SystemExit("ENV مفقودة: TELEGRAM_TOKEN و CHAT_ID مطلوبة.")
@@ -158,6 +158,7 @@ async def tg_send_async(text: str, reply_to: Optional[int]=None, reply_markup: O
 async def tg_send_doc_async(filename: str, bytes_: bytes, caption: str="") -> bool:
     return await asyncio.to_thread(tg_send_doc, filename, bytes_, caption)
 
+# ✅ FIXED VERSION
 async def poll_commands(handler: Callable[[str,str], asyncio.Future]):
     if not POLL_COMMANDS: 
         return
@@ -165,10 +166,10 @@ async def poll_commands(handler: Callable[[str,str], asyncio.Future]):
     global TG_OFFSET
     while True:
         try:
+            # لا نرسل None أبداً كـ argument إضافي
             resp = await asyncio.to_thread(
                 requests.get,
                 GET_UPD,
-                None,
                 params={"timeout": 25, "offset": TG_OFFSET + 1},
                 timeout=35
             )
@@ -499,7 +500,8 @@ async def htf_alignment_ok(ex, symbol:str, regime:str)->Optional[bool]:
     return True
 
 def detect_regime(df:pd.DataFrame, adx_now:float, atr_now:float)->str:
-    c["close"]
+    # ✅ FIX: عرفنا c من df
+    c = df["close"]
     ema200_series=ema(c,200)
     ema50_series=ema(c,50)
     
@@ -735,7 +737,6 @@ async def analyze_signal(ex, symbol:str, df:pd.DataFrame)->Tuple[Optional[Dict],
             
             # Check for bullish reversal signs
             bullish_candle = c_now > o_now
-            hammer_like = (c_now - l.iloc[i]) < body * 0.5  # Small lower wick
             
             if not bullish_candle:
                 return None, {"no_bullish_candle":True}
@@ -748,7 +749,6 @@ async def analyze_signal(ex, symbol:str, df:pd.DataFrame)->Tuple[Optional[Dict],
                 return None, {"volume_low_ranging":round(volume_ratio,2)}
             
             bearish_candle = c_now < o_now
-            shooting_star = (h.iloc[i] - c_now) < body * 0.5
             
             if not bearish_candle:
                 return None, {"no_bearish_candle":True}
@@ -928,7 +928,7 @@ async def scan_cycle(ex, symbols:List[str]):
     await asyncio.gather(*[asyncio.create_task(worker(s)) for s in symbols], return_exceptions=True)
 
 # ============================== FASTAPI + STARTUP ==============================
-app = FastAPI(title="Futures Signal Engine Enhanced", version="6.1.0")
+app = FastAPI(title="Futures Signal Engine Enhanced", version="6.1.1")
 app.state.exchange=None
 app.state.exchange_id=EXCHANGE_NAME
 app.state.symbols=[]
